@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -1371,6 +1372,19 @@ public:
     int64_t total_accepted_token_num       = 0;
     int64_t total_stream_num               = 0;
     int64_t spec_steps                     = 0;
+    // Host step diagnostics and acceptance-rate reports retain their existing
+    // cadence. Completed decode cycles are reported separately with the accept
+    // count and batch size from that exact cycle.
+    bool   cycle_metrics_only = false;
+    double cycle_latency_us   = 0;
+
+    std::optional<double> estimatedTpotUs() const {
+        if (!cycle_metrics_only || cycle_latency_us <= 0 || total_accepted_token_num <= 0 || total_stream_num <= 0
+            || total_propose_token_num <= 0) {
+            return std::nullopt;
+        }
+        return cycle_latency_us * static_cast<double>(total_stream_num) / static_cast<double>(total_accepted_token_num);
+    }
 };
 
 class RtpLLMSpeculativeEngineMetrics: public kmonitor::MetricsGroup {
@@ -1389,6 +1403,7 @@ public:
     kmonitor::MutableMetric* sp_avg_accept_rate_metric             = nullptr;
     kmonitor::MutableMetric* sp_avg_fix_accept_rate_metric         = nullptr;
     kmonitor::MutableMetric* sp_estimate_tpot_us_metric            = nullptr;
+    kmonitor::MutableMetric* cycle_latency_us_metric               = nullptr;
 
 private:
     AUTIL_LOG_DECLARE();

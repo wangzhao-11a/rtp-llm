@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
 #include "rtp_llm/cpp/cache/CacheTopology.h"
+#include "rtp_llm/cpp/cache/LinearReplayPlan.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -57,6 +58,10 @@ public:
 
     // Attention-specific configuration
     int linear_step = 1;  // For Linear attention: keep one cache block every `linear_step` blocks
+
+    // Accepted-prefix replay is enabled for target LINEAR groups during MTP.
+    // Group IDs follow the merged physical topology; the draft groups are excluded.
+    LinearReplayPlan linear_replay;
 
     // mtp-model configurations
     std::vector<std::shared_ptr<CacheConfig>> mtp_sub_configs;

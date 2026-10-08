@@ -785,6 +785,9 @@ void NormalEngine::initCacheManager(std::optional<WarmUpResult> warm_up_result) 
                                                   nullptr;
     auto               config               = CacheConfigCreator::createConfig(
         model_config_, parallelism_config, kv_cache_config, sp_config, draft_model_config, isMTPEagle(), isEagle());
+    CacheConfigCreator::configureDecodeLinearPool(config, parallelism_config, runtime_config);
+    CacheConfigCreator::configureLinearReplay(
+        config, model_config_, parallelism_config, runtime_config, sp_config, isMTPEagle());
     const auto local_block_num = CacheConfigCreator::computeLocalBlockNum(
         config, model_config_, runtime_config, kv_cache_config, parallelism_config, warm_up_result, sp_config);
     const auto confirmed_block_num = CacheConfigCreator::synchronizeBlockNum(local_block_num, parallelism_config);
@@ -992,6 +995,9 @@ NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>&
 
 absl::Status NormalEngine::step() try {
     RTP_LLM_PROFILE_SCOPE("engine.normal.step_work");
+    if (pause_) {
+        executor_->onIdle();
+    }
     while (pause_) {
         // wait 50ms if system paused.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1011,6 +1017,7 @@ absl::Status NormalEngine::step() try {
         // TP collectives and FFN-disaggregate alignment both require empty batches to enter process().
         if (shouldEarlyReturnEmptyBatch(
                 streams.empty(), parallelism_config.tp_size, ffn_disaggregate_config.enable_ffn_disaggregate)) {
+            executor_->onIdle();
             return absl::OkStatus();
         }
     }
@@ -1058,6 +1065,7 @@ absl::Status NormalEngine::step() try {
 
     return status;
 } catch (const std::exception& exception) {
+    executor_->onIdle();
     if (isTorchCudaOom(exception)) {
         dumpFatalTorchCudaOomDiagnostics(parallelism_config.local_rank, exception);
     }

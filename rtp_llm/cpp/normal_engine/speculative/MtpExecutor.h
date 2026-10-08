@@ -1,9 +1,13 @@
 #pragma once
 
 #include <functional>
+#include <condition_variable>
+#include <deque>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
@@ -46,9 +50,11 @@ public:
                          MlaOpsType                                     mla_ops_type       = MlaOpsType::AUTO,
                          int32_t                                        kv_cache_group_num = 1,
                          bool                                           warm_up            = false);
+    ~MtpExecutor() override;
 
     absl::Status process(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us = 0) override;
     bool         updateEplbConfig(const EPLBConfig& config) override;
+    void         onIdle() override;
 
     void setTargetModel(std::unique_ptr<ModelBase> model) {
         model_ = std::move(model);
@@ -94,6 +100,12 @@ public:
                                                              bool linear_attention,
                                                              bool cache_snapshot_ready = false);
     static int selectMtpPreviousSeqLenUpperBound(bool pending, int previous_next_bound, int host_seq_len);
+    static bool              hasLinearCacheSnapshotCapacity(const std::list<GenerateStreamPtr>& streams,
+                                                            const CacheConfig&                  cache_config,
+                                                            const std::vector<CacheGroupType>&  group_types,
+                                                            int64_t                             physical_width,
+                                                            int64_t                             kernel_width,
+                                                            int64_t                             max_accept_length);
 
 protected:
     static bool dsparkPrefillCPRoleIsValid(const PrefillCPConfig& prefill_cp_config, RoleType role_type);
@@ -106,6 +118,43 @@ protected:
         // rows as total_accept_len, so the bucket sums match it exactly.
         std::map<int32_t, int64_t> accept_len_by_priority;
         bool                       valid = false;
+    };
+
+    struct DecodeCycleMetricsSample {
+        // Keep both sides of the existing metrics D2H alive without changing
+        // the TPS consumer's one-round-delayed staging or adding a copy.
+        torch::Tensor                 sum_gpu;
+        torch::Tensor                 sum_cpu;
+        torch::Tensor                 rows_gpu;
+        torch::Tensor                 rows_cpu;
+        std::shared_ptr<torch::Event> accept_ready;
+        std::shared_ptr<torch::Event> previous_tail;
+        std::shared_ptr<torch::Event> tail;
+        int64_t                       previous_host_tail_us = 0;
+        int64_t                       host_tail_us          = 0;
+        int64_t                       stream_num            = 0;
+        int64_t                       propose_token_num     = 0;
+        int64_t                       spec_steps            = 0;
+    };
+
+    class DecodeCycleMetricsReporter {
+    public:
+        using Report = std::function<void(RtpLLMSpeculativeEngineMetricsCollector&)>;
+        explicit DecodeCycleMetricsReporter(Report report);
+        ~DecodeCycleMetricsReporter();
+        void        enqueue(DecodeCycleMetricsSample sample);
+        void        stop();
+        static bool collectIfReady(const DecodeCycleMetricsSample&          sample,
+                                   RtpLLMSpeculativeEngineMetricsCollector& collector);
+
+    private:
+        void                                 run();
+        Report                               report_;
+        std::mutex                           mutex_;
+        std::condition_variable              ready_;
+        std::deque<DecodeCycleMetricsSample> samples_;
+        bool                                 stopping_ = false;
+        std::thread                          thread_;
     };
 
     bool isTpRank0() const;
@@ -170,6 +219,8 @@ protected:
                                       const torch::Tensor&                         kv_cache_kernel_block_id,
                                       GptModelOutputs                              draft_prefill_model_output,
                                       SamplerOutput                                draft_prefill_sampler_output,
+                                      const std::optional<LinearReplayInputs>&      linear_replay,
+                                      const std::vector<GenerateStream::LinearReplayRound>& replay_rounds,
                                       std::shared_ptr<torch::Event>                rejection_event,
                                       std::shared_ptr<torch::Event>                draft_event);
 
@@ -189,6 +240,7 @@ protected:
                                                    torch::Event&        accept_len_ready_event,
                                                    size_t               stream_count,
                                                    std::vector<int32_t> row_priorities);
+    void                     finishDecodeCycleMetrics();
 
     void prepareStreams(const std::list<GenerateStreamPtr>& streams,
                         std::list<GenerateStreamPtr>&       prefill_streams,
@@ -203,6 +255,11 @@ protected:
     bool useAsyncDeviceState() const;
 
     bool useAsyncPrepare() const;
+    void recordLinearReplayLastUse(const std::vector<GenerateStream::LinearReplayRound>& rounds);
+    void publishLinearReplayWindows(const StreamGroups& stream_groups,
+                                    const LinearReplayInputs& replay,
+                                    const std::vector<GenerateStream::LinearReplayRound>& rounds,
+                                    const torch::Tensor& accept_lengths);
 
     // Opt-in gate to skip the broad sync at decodeStep start.
     // Device state, epoch-guarded clears, and single-slotted workers preserve
@@ -212,14 +269,16 @@ protected:
     // Attach next-step device state, then fork a worker that waits on caller-
     // recorded rejection/draft events and runs D2H/specUpdate/KV release off
     // the main thread.
-    absl::Status dispatchDecodeAsync(const StreamGroups&                          stream_groups,
-                                     const speculative::SpeculativeSamplerOutput& spec_decode_output,
-                                     const torch::Tensor&                         verify_position_ids,
-                                     const torch::Tensor&                         kv_cache_block_id,
-                                     const torch::Tensor&                         kv_cache_kernel_block_id,
-                                     MergedOutput                                 draft_prefill_output,
-                                     std::shared_ptr<torch::Event>                rejection_event,
-                                     std::shared_ptr<torch::Event>                draft_event);
+    absl::Status dispatchDecodeAsync(const StreamGroups&                                   stream_groups,
+                                     const speculative::SpeculativeSamplerOutput&          spec_decode_output,
+                                     const torch::Tensor&                                  verify_position_ids,
+                                     const torch::Tensor&                                  kv_cache_block_id,
+                                     const torch::Tensor&                                  kv_cache_kernel_block_id,
+                                     MergedOutput                                          draft_prefill_output,
+                                     const std::optional<LinearReplayInputs>&              linear_replay,
+                                     const std::vector<GenerateStream::LinearReplayRound>& replay_rounds,
+                                     std::shared_ptr<torch::Event>                         rejection_event,
+                                     std::shared_ptr<torch::Event>                         draft_event);
 
     // Synchronous dispatch also publishes the same per-stream device state as
     // the async path, using the host seqLength after specUpdate as truth.
@@ -308,12 +367,18 @@ private:
     std::shared_ptr<torch::Event> metrics_accept_len_ready_event_;
     int64_t                       metrics_accept_len_stream_num_        = 0;
     int64_t                       metrics_accept_len_propose_token_num_ = 0;
+    // Only the engine thread mutates the baseline. The reporter owns immutable
+    // samples and stops before any model/device resources are destroyed.
+    std::shared_ptr<torch::Event>               previous_decode_tail_;
+    int64_t                                     previous_decode_host_tail_us_ = 0;
+    std::unique_ptr<DecodeCycleMetricsReporter> decode_cycle_metrics_reporter_;
 
     AsyncRunner target_verify_prepare_runner_;
     AsyncRunner draft_prefill_prepare_runner_;
     // Declare the worker after its target so destruction joins the worker first.
     std::unique_ptr<SpecLogitsVerifyRunner> spec_logits_verify_runner_;
     AsyncRunner                             spec_logits_verify_async_runner_;
+    AsyncRunner                             spec_sampler_prepare_runner_;
 
     // Bookkeeping worker for stream-async decode dispatch. It owns a CUDA
     // stream + thread and runs D2H/specUpdate/KV release off the main thread.

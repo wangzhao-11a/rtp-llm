@@ -6,6 +6,30 @@ from rtp_llm.models.kimi_k3.kimi_k3 import KimiK3, KimiK3ModelConfig, KimiK3Mtp
 from rtp_llm.utils.model_weight import W
 
 
+class KimiK3MainCacheConfigTest(unittest.TestCase):
+    def test_kda_replay_cache_uses_per_channel_gate(self):
+        config = KimiK3ModelConfig()
+        KimiK3._parse_attention_config(
+            {
+                "num_attention_heads": 96,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "kv_lora_rank": 512,
+                "v_head_dim": 128,
+                "linear_attn_config": {"num_heads": 96, "head_dim": 128},
+            },
+            config,
+        )
+
+        linear = config.linear_attention_config
+        self.assertEqual(linear.linear_key_head_dim, 128)
+        self.assertEqual(linear.linear_value_head_dim, 128)
+        self.assertEqual(linear.linear_num_value_heads, 96)
+        # KDA's forget gate has one value per key channel, not per head.
+        self.assertTrue(linear.replay_vector_gate)
+
+
+
 class KimiK3MtpMediaTokenConfigTest(unittest.TestCase):
     def setUp(self):
         backend = patch.dict("os.environ", {"KIMI_K3_KDA_PREFILL_BACKEND": "rtp"})

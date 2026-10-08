@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
+#include <future>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -41,6 +44,136 @@ namespace rtp_llm {
 
 using namespace std;
 namespace spec = speculative;
+
+class MtpCycleMetricsTestAccess: public MtpExecutor {
+public:
+    using MtpExecutor::DecodeCycleMetricsReporter;
+    using MtpExecutor::DecodeCycleMetricsSample;
+};
+
+TEST(MtpExecutorCycleMetricsTest, CompleteCycleUsesItsOwnAcceptedTokensAndBatchSize) {
+    MtpCycleMetricsTestAccess::DecodeCycleMetricsSample sample;
+    sample.sum_cpu               = torch::tensor({20}, torch::kInt64);
+    sample.previous_host_tail_us = 100000;
+    sample.host_tail_us          = 160000;
+    sample.stream_num            = 8;
+    sample.propose_token_num     = 32;
+    sample.spec_steps            = 4;
+    RtpLLMSpeculativeEngineMetricsCollector collector;
+    ASSERT_TRUE(MtpCycleMetricsTestAccess::DecodeCycleMetricsReporter::collectIfReady(sample, collector));
+    // Host enqueue time must not replace the complete cycle or its denominator.
+    collector.step_latency_us = 1000;
+    ASSERT_TRUE(collector.estimatedTpotUs().has_value());
+    EXPECT_DOUBLE_EQ(collector.cycle_latency_us, 60000);
+    EXPECT_DOUBLE_EQ(*collector.estimatedTpotUs(), 24000);
+
+    // The next batch can have a different size/acceptance. Both values belong
+    // to its own immutable sample, rather than the batch consuming the metric.
+    sample.sum_cpu               = torch::tensor({9}, torch::kInt64);
+    sample.previous_host_tail_us = 160000;
+    sample.host_tail_us          = 220000;
+    sample.stream_num            = 3;
+    sample.propose_token_num     = 12;
+    ASSERT_TRUE(MtpCycleMetricsTestAccess::DecodeCycleMetricsReporter::collectIfReady(sample, collector));
+    ASSERT_TRUE(collector.estimatedTpotUs().has_value());
+    EXPECT_DOUBLE_EQ(*collector.estimatedTpotUs(), 20000);
+}
+
+TEST(MtpExecutorCycleMetricsTest, FirstRoundAndHostDiagnosticsDoNotEmitEstimatedTpot) {
+    MtpCycleMetricsTestAccess::DecodeCycleMetricsSample sample;
+    sample.sum_cpu           = torch::tensor({8}, torch::kInt64);
+    sample.host_tail_us      = 160000;
+    sample.stream_num        = 4;
+    sample.propose_token_num = 16;
+    RtpLLMSpeculativeEngineMetricsCollector collector;
+    ASSERT_TRUE(MtpCycleMetricsTestAccess::DecodeCycleMetricsReporter::collectIfReady(sample, collector));
+    EXPECT_FALSE(collector.estimatedTpotUs().has_value());
+
+    // The existing process() collector still reports host step latency and
+    // acceptance rates, but its one-round-delayed counts do not estimate TPOT.
+    collector.cycle_metrics_only = false;
+    collector.cycle_latency_us   = 60000;
+    collector.step_latency_us    = 1000;
+    EXPECT_FALSE(collector.estimatedTpotUs().has_value());
+}
+
+TEST(MtpExecutorCycleMetricsTest, SamplesRetainStagedAcceptanceAndFlushWithoutAnotherDecode) {
+    auto                                                staged_sum = torch::tensor({8}, torch::kInt64);
+    MtpCycleMetricsTestAccess::DecodeCycleMetricsSample sample;
+    sample.sum_cpu               = staged_sum;
+    sample.previous_host_tail_us = 100000;
+    sample.host_tail_us          = 160000;
+    sample.stream_num            = 4;
+    sample.propose_token_num     = 16;
+    // Replacing the TPS slot must not replace this sample's accepted count.
+    staged_sum = torch::tensor({100}, torch::kInt64);
+
+    std::promise<RtpLLMSpeculativeEngineMetricsCollector> reported;
+    auto                                                  future = reported.get_future();
+    std::atomic<int>                                      report_count{0};
+    MtpCycleMetricsTestAccess::DecodeCycleMetricsReporter reporter(
+        [&reported, &report_count](RtpLLMSpeculativeEngineMetricsCollector& collector) {
+            if (report_count.fetch_add(1) == 0) {
+                reported.set_value(collector);
+            }
+        });
+    reporter.enqueue(std::move(sample));
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    const auto collector = future.get();
+    EXPECT_EQ(collector.total_accepted_token_num, 8);
+    ASSERT_TRUE(collector.estimatedTpotUs().has_value());
+    EXPECT_DOUBLE_EQ(*collector.estimatedTpotUs(), 30000);
+    reporter.stop();
+    EXPECT_EQ(report_count.load(), 1);
+}
+
+#if USING_CUDA || USING_ROCM
+TEST(MtpExecutorCycleMetricsTest, ReadyGpuTailEventsMeasureTheCompleteCycle) {
+    auto previous = std::make_shared<torch::Event>(GRAPH_DEVICE_TYPE, c10::EventFlag::BACKEND_DEFAULT);
+    auto tail     = std::make_shared<torch::Event>(GRAPH_DEVICE_TYPE, c10::EventFlag::BACKEND_DEFAULT);
+    previous->record(cuda_graph::graphGetCurrentStream());
+    auto work = torch::ones({1024}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    work.add_(1);
+    tail->record(cuda_graph::graphGetCurrentStream());
+    tail->synchronize();
+
+    MtpCycleMetricsTestAccess::DecodeCycleMetricsSample sample;
+    sample.sum_cpu           = torch::tensor({8}, torch::kInt64);
+    sample.previous_tail     = previous;
+    sample.tail              = tail;
+    sample.stream_num        = 4;
+    sample.propose_token_num = 16;
+    RtpLLMSpeculativeEngineMetricsCollector collector;
+    ASSERT_TRUE(MtpCycleMetricsTestAccess::DecodeCycleMetricsReporter::collectIfReady(sample, collector));
+    EXPECT_DOUBLE_EQ(collector.cycle_latency_us, previous->elapsedTime(*tail) * 1000.0);
+    ASSERT_TRUE(collector.estimatedTpotUs().has_value());
+    EXPECT_DOUBLE_EQ(*collector.estimatedTpotUs(), collector.cycle_latency_us / 2.0);
+}
+
+TEST(MtpExecutorCycleMetricsTest, GpuCycleIncludesHostSchedulerWaitBetweenRounds) {
+    auto previous = std::make_shared<torch::Event>(GRAPH_DEVICE_TYPE, c10::EventFlag::BACKEND_DEFAULT);
+    auto tail     = std::make_shared<torch::Event>(GRAPH_DEVICE_TYPE, c10::EventFlag::BACKEND_DEFAULT);
+    previous->record(cuda_graph::graphGetCurrentStream());
+    previous->synchronize();
+    // Deliberately leave the stream idle, as when a scheduler waits for the
+    // previous worker. A host decodeStep-only timer would omit this interval.
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    tail->record(cuda_graph::graphGetCurrentStream());
+    tail->synchronize();
+
+    MtpCycleMetricsTestAccess::DecodeCycleMetricsSample sample;
+    sample.sum_cpu           = torch::tensor({8}, torch::kInt64);
+    sample.previous_tail     = previous;
+    sample.tail              = tail;
+    sample.stream_num        = 4;
+    sample.propose_token_num = 16;
+    RtpLLMSpeculativeEngineMetricsCollector collector;
+    ASSERT_TRUE(MtpCycleMetricsTestAccess::DecodeCycleMetricsReporter::collectIfReady(sample, collector));
+    EXPECT_GE(collector.cycle_latency_us, 10000);
+    ASSERT_TRUE(collector.estimatedTpotUs().has_value());
+    EXPECT_GE(*collector.estimatedTpotUs(), 5000);
+}
+#endif
 
 TEST(MtpExecutorPolicyTest, DSparkPrefillCPRequiresPrefillRole) {
     PrefillCPConfig prefill_cp_config;
@@ -1124,6 +1257,237 @@ public:
     }
 };
 
+TEST_F(MtpExecutorTest, IdleAndEmptyBatchesBreakCycleContinuity) {
+    auto  components = createMtpExecutorComponents(MtpExecutorTestConfig{});
+    auto* executor   = components.executor.get();
+    executor->previous_decode_tail_ =
+        std::make_shared<torch::Event>(GRAPH_DEVICE_TYPE, c10::EventFlag::BACKEND_DEFAULT);
+    executor->previous_decode_host_tail_us_ = 100000;
+    executor->onIdle();
+    EXPECT_FALSE(executor->previous_decode_tail_);
+    EXPECT_EQ(executor->previous_decode_host_tail_us_, 0);
+
+    executor->previous_decode_tail_ =
+        std::make_shared<torch::Event>(GRAPH_DEVICE_TYPE, c10::EventFlag::BACKEND_DEFAULT);
+    executor->previous_decode_host_tail_us_ = 100000;
+    ASSERT_TRUE(executor->process({}).ok());
+    EXPECT_FALSE(executor->previous_decode_tail_);
+    EXPECT_EQ(executor->previous_decode_host_tail_us_, 0);
+}
+
+TEST_F(MtpExecutorTest, LinearReplayAdmissionSkipsTerminalRequests) {
+    auto       components  = createMtpExecutorComponents(MtpExecutorTestConfig{});
+    const auto make_stream = [&] {
+        auto stream                      = createDecodeStream(components.model_config,
+                                         components.runtime_config,
+                                         components.resource_context,
+                                                              {0, 1},
+                                                              {torch::tensor({2}, torch::kInt32).reshape({1, 1}), 1, 3});
+        stream->generate_status_->status = StreamState::RUNNING;
+        return stream;
+    };
+    auto active    = make_stream();
+    auto cancelled = make_stream();
+    auto finished  = make_stream();
+    cancelled->reportError(ErrorCode::CANCELLED, "cancel before admission");
+    finished->generate_status_->status = StreamState::FINISHED;
+
+    std::list<GenerateStreamPtr> prefill_streams;
+    std::list<GenerateStreamPtr> decode_streams;
+    components.executor->prepareStreams({cancelled, active, finished}, prefill_streams, decode_streams);
+    EXPECT_TRUE(prefill_streams.empty());
+    ASSERT_EQ(decode_streams.size(), 1);
+    EXPECT_EQ(decode_streams.front(), active);
+
+    // An entirely cancelled batch still takes the normal skip-run path.
+    ASSERT_TRUE(components.executor->process({cancelled, finished}).ok());
+}
+
+TEST_F(MtpExecutorTest, LinearReplayGatherPreservesCancelledBatchRows) {
+    auto linear      = test::makeLinearSpec("linear", 16, TYPE_FP16, 1, 1);
+    auto full        = test::makeMhaSpec("full", 16, TYPE_FP16, 1, 1);
+    auto config      = test::makeSingleLayerCacheConfig(linear, CacheGroupType::LINEAR, 16);
+    config.layer_num = 2;
+    config.fromGroupedSpecs(
+        {linear, full}, {{0}, {1}}, {CacheGroupType::LINEAR, CacheGroupType::FULL}, {"linear", "full"});
+    auto draft = test::makeSingleLayerCacheConfig(full, CacheGroupType::FULL, 16);
+    config.mtp_sub_configs.push_back(config.mergeMTPModule(draft, 0, config.layer_num));
+    config.finalizeBlockNums(16, RuntimeConfig{});
+    config.linear_replay = LinearReplayPlan::create({0}, 2, 4, {1, 1}, {1, 1}, false, TYPE_FP16, 1);
+
+    MtpExecutorTestConfig test_config;
+    test_config.num_layers                    = 2;
+    test_config.gen_num_per_cycle             = 3;
+    auto  components                          = createMtpExecutorComponents(test_config, &config);
+    auto* executor                            = components.executor.get();
+    components.resource_context.cache_manager = executor->cache_manager_;
+    std::list<GenerateStreamPtr> batch;
+    for (int i = 0; i < 2; ++i) {
+        auto stream                      = createDecodeStream(components.model_config,
+                                         components.runtime_config,
+                                         components.resource_context,
+                                                              {0, 1},
+                                                              {torch::tensor({2}, torch::kInt32).reshape({1, 1}), 1, 3});
+        stream->generate_status_->status = StreamState::RUNNING;
+        ASSERT_TRUE(stream->initKVBlock().ok());
+        ASSERT_TRUE(stream->streamCacheResource().incrKVBlock().ok());
+        batch.push_back(stream);
+    }
+    StreamGroups streams(batch);
+    const auto   cancelled = batch.front();
+    const auto   active    = batch.back();
+    cancelled->reportError(ErrorCode::CANCELLED, "cancel after batch rows are fixed");
+
+    std::vector<int32_t> ids;
+    for (const auto& group : config.groups()) {
+        for (const auto& stream : batch) {
+            ids.push_back(stream->streamCacheResource().kvCache().blocks(0, group.tag).at(0));
+        }
+    }
+    const auto     cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    TensorHolder   holder;
+    GptModelInputs input;
+    input.kv_cache_kernel_block_id = torch::tensor(ids, cuda_i32).reshape({2, 2, 1});
+    std::vector<GenerateStream::LinearReplayRound> rounds;
+    const auto                                     status =
+        executor->batch_stream_processor_->gatherLinearReplayInputs(streams, config, input, holder, rounds);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_EQ(rounds.size(), 2);
+    auto slots = input.linear_replay->slot_ids.cpu();
+    EXPECT_EQ(slots[0].item<int32_t>(), rounds[0].lease->slot_id);
+    EXPECT_EQ(slots[1].item<int32_t>(), rounds[1].lease->slot_id);
+    EXPECT_NE(rounds[0].lease->slot_id, rounds[1].lease->slot_id);
+
+    executor->publishLinearReplayWindows(streams, *input.linear_replay, rounds, torch::ones({2}, cuda_i32));
+    EXPECT_EQ(cancelled->linear_replay_window_, nullptr);
+    ASSERT_NE(active->linear_replay_window_, nullptr);
+    EXPECT_EQ(active->linear_replay_window_->lease, rounds[1].lease);
+
+    const auto                 previous_length = active->seqLength();
+    const StreamSpecUpdateInfo update{torch::tensor({3}, torch::kInt32).reshape({1, 1}), 1, 3};
+    cancelled->specUpdate(update);
+    active->specUpdate(update);
+    EXPECT_EQ(cancelled->seqLength(), previous_length);
+    EXPECT_EQ(active->seqLength(), previous_length + 1);
+    EXPECT_EQ(cancelled->statusInfo().code(), ErrorCode::CANCELLED);
+}
+
+TEST_F(MtpExecutorTest, LinearReplayAsyncDispatchPreservesAcceptedWindowAndPageTable) {
+    auto linear      = test::makeLinearSpec("linear", 16, TYPE_FP16, 1, 1);
+    auto full        = test::makeMhaSpec("full", 16, TYPE_FP16, 1, 1);
+    auto config      = test::makeSingleLayerCacheConfig(linear, CacheGroupType::LINEAR, 16);
+    config.layer_num = 2;
+    config.fromGroupedSpecs(
+        {linear, full}, {{0}, {1}}, {CacheGroupType::LINEAR, CacheGroupType::FULL}, {"linear", "full"});
+    auto draft = test::makeSingleLayerCacheConfig(full, CacheGroupType::FULL, 16);
+    config.mtp_sub_configs.push_back(config.mergeMTPModule(draft, 0, config.layer_num));
+    config.finalizeBlockNums(16, RuntimeConfig{});
+    config.linear_replay = LinearReplayPlan::create({0}, 1, 4, {1, 1}, {1, 1}, false, TYPE_FP16, 1);
+
+    MtpExecutorTestConfig test_config;
+    test_config.num_layers                    = 2;
+    test_config.gen_num_per_cycle             = 3;
+    auto  components                          = createMtpExecutorComponents(test_config, &config);
+    auto* executor                            = components.executor.get();
+    components.resource_context.cache_manager = executor->cache_manager_;
+    auto stream                               = createDecodeStream(components.model_config,
+                                     components.runtime_config,
+                                     components.resource_context,
+                                                                   {0, 1},
+                                                                   {torch::tensor({2}, torch::kInt32).reshape({1, 1}), 1, 3});
+    stream->generate_status_->status          = StreamState::RUNNING;
+    stream->setIsContextStream(false);
+    ASSERT_TRUE(stream->initKVBlock().ok());
+    ASSERT_TRUE(stream->streamCacheResource().incrKVBlock().ok());
+
+    const auto           cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    std::vector<int32_t> ids;
+    for (const auto& group : config.groups()) {
+        ids.push_back(stream->streamCacheResource().kvCache().blocks(0, group.tag).at(0));
+    }
+    auto           table = torch::tensor(ids, cuda_i32).reshape({2, 1, 1});
+    StreamGroups   streams({stream});
+    TensorHolder   holder;
+    GptModelInputs input;
+    input.kv_cache_kernel_block_id = table;
+    std::vector<GenerateStream::LinearReplayRound> rounds;
+    ASSERT_TRUE(
+        executor->batch_stream_processor_->gatherLinearReplayInputs(streams, config, input, holder, rounds).ok());
+
+    spec::SpeculativeSamplerOutput accepted;
+    accepted.accept_len        = torch::tensor({3}, cuda_i32);
+    accepted.accept_tokens     = torch::tensor({1, 2, 3, 0}, cuda_i32).reshape({1, 4});
+    accepted.accept_len_cpu    = accepted.accept_len.to(torch::kCPU, true);
+    accepted.accept_tokens_cpu = accepted.accept_tokens.to(torch::kCPU, true);
+    accepted.transfer_done_event->record(cuda_graph::graphGetCurrentStream());
+    MergedOutput draft_output;
+    draft_output.sampler_output.token_ids       = torch::tensor({3}, cuda_i32).reshape({1, 1});
+    draft_output.sampler_output.all_probs       = torch::ones({1, 4}, table.options().dtype(torch::kFloat32));
+    draft_output.model_output.all_hidden_states = torch::zeros({4, 2}, draft_output.sampler_output.all_probs.options());
+    auto ready                                  = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    ready->record(cuda_graph::graphGetCurrentStream());
+    const char* stream_async = std::getenv("RTP_LLM_STREAM_ASYNC");
+    if (stream_async && std::string(stream_async) == "1") {
+        ASSERT_TRUE(executor->useStreamAsync());
+        ASSERT_TRUE(executor
+                        ->dispatchDecodeOutput(streams,
+                                               {stream},
+                                               accepted,
+                                               torch::Tensor(),
+                                               table,
+                                               table,
+                                               draft_output.model_output,
+                                               draft_output.sampler_output,
+                                               input.linear_replay,
+                                               rounds,
+                                               ready,
+                                               ready)
+                        .ok());
+    } else {
+        ASSERT_TRUE(executor
+                        ->dispatchDecodeAsync(streams,
+                                              accepted,
+                                              torch::Tensor(),
+                                              table,
+                                              table,
+                                              draft_output,
+                                              input.linear_replay,
+                                              rounds,
+                                              ready,
+                                              ready)
+                        .ok());
+    }
+
+    auto next_round = stream->prepareLinearReplayRound();
+    ASSERT_TRUE(next_round.ok());
+    ASSERT_NE(next_round->previous_window, nullptr);
+    EXPECT_NE(next_round->previous_window->accept_len_gpu.data_ptr(), accepted.accept_len.data_ptr());
+    EXPECT_FALSE(executor->useAsyncPrepare());
+    executor->spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+    EXPECT_EQ(stream->seqLength(), 6);
+
+    // Simulate the sampler and verify buffers being reused in the next round.
+    accepted.accept_len.fill_(1);
+    input.linear_replay->anchor_processed_lengths.fill_(99);
+    input.linear_replay->active_block_ids.fill_(-1);
+    GptModelInputs next_input;
+    next_input.kv_cache_kernel_block_id = table;
+    std::vector<GenerateStream::LinearReplayRound> next_rounds;
+    ASSERT_TRUE(
+        executor->batch_stream_processor_->gatherLinearReplayInputs(streams, config, next_input, holder, next_rounds)
+            .ok());
+    EXPECT_EQ(next_input.linear_replay->prev_accept_lengths.cpu().item<int32_t>(), 3);
+    EXPECT_EQ(next_input.linear_replay->anchor_processed_lengths.cpu().item<int32_t>(), 5);
+    EXPECT_EQ(next_input.linear_replay->state_read_block_ids.cpu()[0][0].item<int32_t>(), ids[0]);
+
+    if (executor->useDeviceInput()) {
+        const auto state = stream->getMtpAsyncDeviceState();
+        ASSERT_TRUE(GenerateStream::hasMtpCacheSnapshot(state));
+        EXPECT_TRUE(torch::equal(state.next_kv_cache_block_id_gpu.cpu(), table.cpu()));
+        EXPECT_TRUE(torch::equal(state.next_kv_cache_kernel_block_id_gpu.cpu(), table.cpu()));
+    }
+}
+
 class MtpCacheStrideTest: public MtpExecutorTest, public ::testing::WithParamInterface<int> {};
 
 TEST_P(MtpCacheStrideTest, ForwardAndPrepareUseSingleGroupStrideOnly) {
@@ -2085,7 +2449,7 @@ void MtpExecutorTest::runSingleBatchDecodeScenario(bool with_prefill_only) {
     auto next_draft_output   = GptModelOutputs{};
     next_draft_output.logits = torch::tensor({1.9f, 1.10f, 1.11f, 1.12f}).reshape({(int64_t)batch_size, 4});
     next_draft_output.all_hidden_states =
-        torch::tensor({0.1f, 0.1f, 0.2f, 0.22f, 0.3f, 0.33f, 0.0f, 0.0f, 0.0f, 0.0f}).reshape({5, 2});
+        torch::tensor({0.1f, 0.1f, 0.2f, 0.22f, 0.3f, 0.33f, 0.0f, 0.0f, 0.0f, 0.0f}).reshape({5, 2}).to(torch::kCUDA);
 
     next_draft_input.combo_tokens      = torch::tensor({3, 2, 0}, torch::kInt32);
     next_draft_input.input_lengths     = torch::tensor({3}, torch::kInt32);
@@ -2112,9 +2476,15 @@ void MtpExecutorTest::runSingleBatchDecodeScenario(bool with_prefill_only) {
                                .reshape({(int64_t)(batch_size * (propose_step + 1)), 4});
     target_output.all_hidden_states =
         torch::tensor({0.01f, 0.02f, 0.03f, 0.04f, 0.05f, 0.06f, 0.07f, 0.08f, 0.09f, 0.10f})
-            .reshape({(int64_t)(propose_step + 1), 2});
+            .reshape({(int64_t)(propose_step + 1), 2})
+            .to(torch::kCUDA);
 
     next_draft_input.last_hidden_states = target_output.all_hidden_states.narrow(0, 0, 3);
+    if (components.executor->useStreamAsync() || components.executor->useAsyncDeviceState()) {
+        next_draft_input.combo_tokens       = torch::tensor({3, 2, 0, 0, 0}, torch::kInt32);
+        next_draft_input.input_lengths      = torch::tensor({5}, torch::kInt32);
+        next_draft_input.last_hidden_states = target_output.all_hidden_states;
+    }
 
     components.fake_draft_model->setInputs({draft_input_1, draft_input_2, draft_input_3});
     components.fake_draft_model->setOutputs({draft_output_1, draft_output_2, draft_output_3});
@@ -2135,7 +2505,7 @@ void MtpExecutorTest::runSingleBatchDecodeScenario(bool with_prefill_only) {
     auto target_sample_all_probs_data = createRandomVector<float>(batch_size * (propose_step + 1) * vocab_size, 1);
     auto sampler_input                = SamplerInputs{target_output.logits};
     auto sampler_output =
-        SamplerOutput{torch::tensor({3, 2, 0, 0, 0}, torch::kInt32).reshape({(int64_t)batch_size, 5})};
+        SamplerOutput{torch::tensor({3, 2, 0, 0, 0}, torch::kInt32).reshape({(int64_t)batch_size * 5, 1})};
     sampler_output.all_probs = torch::tensor(target_sample_all_probs_data)
                                    .reshape({(int64_t)batch_size, (int64_t)(propose_step + 1), (int64_t)vocab_size});
     components.fake_sampler->setInputs({sampler_input});
@@ -2203,6 +2573,7 @@ void MtpExecutorTest::runSingleBatchDecodeScenario(bool with_prefill_only) {
     auto status = with_prefill_only ? components.executor->process({prefill_only_stream, stream1}) :
                                       components.executor->process({stream1});
     ASSERT_TRUE(status.ok());
+    components.executor->spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
     if (with_prefill_only) {
         EXPECT_TRUE(prefill_only_stream->hasEvent(StreamEvents::GenerateDone));
         auto prefill_output = prefill_only_stream->nextOutput();
@@ -3301,6 +3672,126 @@ TEST_F(MtpExecutorTest, testErroredSpecLogitsStreamDoesNotAbortExecutor) {
     auto status = components.executor->process({stream});
     EXPECT_TRUE(status.ok());
     EXPECT_TRUE(stream->hasError());
+}
+
+class MtpCacheSnapshotCapacityTest: public MtpExecutorTest {
+protected:
+    CacheConfig makeCapacityConfig(bool second_linear = false) {
+        auto linear = test::makeLinearSpec("linear", 32768, TYPE_FP16, 1, 1);
+        auto full   = test::makeMhaSpec("full", 2048, TYPE_FP16, 1, 1);
+        auto config = test::makeSingleLayerCacheConfig(linear, CacheGroupType::LINEAR, 16);
+        if (second_linear) {
+            auto other       = test::makeLinearSpec("other_linear", 65536, TYPE_FP16, 1, 1);
+            config.layer_num = 3;
+            config.fromGroupedSpecs({linear, other, full},
+                                    {{0}, {1}, {2}},
+                                    {CacheGroupType::LINEAR, CacheGroupType::LINEAR, CacheGroupType::FULL},
+                                    {"linear", "other_linear", "full"});
+        } else {
+            config.layer_num = 2;
+            config.fromGroupedSpecs(
+                {linear, full}, {{0}, {1}}, {CacheGroupType::LINEAR, CacheGroupType::FULL}, {"linear", "full"});
+        }
+        config.seq_size_per_block = 2048;
+        config.finalizeBlockNums(16, RuntimeConfig{});
+        return config;
+    }
+
+    GenerateStreamPtr
+    makeCapacityStream(const CacheConfig& config, int seq_length, const std::vector<size_t>& capacities) {
+        ModelConfig model_config;
+        model_config.max_seq_len                  = 131080;
+        model_config.vocab_size                   = 4;
+        model_config.num_layers                   = config.layer_num;
+        model_config.attn_config.tokens_per_block = config.seq_size_per_block;
+        // No pool allocation is needed to exercise the production guard.
+        // An empty manager also keeps these synthetic logical rows from
+        // being returned to a real pool at teardown; all IDs are null.
+        auto stream = createContextStream(model_config, RuntimeConfig{}, ResourceContext{}, {0});
+        stream->getCompleteTokenIds()->setSeqLength(seq_length);
+        auto& resource = stream->kvCacheMutable();
+        resource.initGroups(config.topologyPtr());
+        for (size_t group_id = 0; group_id < config.groups().size(); ++group_id) {
+            resource.setBatchBlocks(
+                0, config.groups()[group_id].tag, BlockIndicesType(capacities.at(group_id), NULL_BLOCK_IDX));
+        }
+        return stream;
+    }
+};
+
+TEST_F(MtpCacheSnapshotCapacityTest, UsesGroupSpanAndAcceptsExactEffectiveCapacity) {
+    auto config = makeCapacityConfig();
+    auto types  = test::publishedGroupTypes(config.topology());
+    auto stream = makeCapacityStream(config, /*seq_length=*/65537, {6, 1});
+    ASSERT_EQ(config.seq_size_per_block, 2048);
+    ASSERT_EQ(config.group("linear").seqSizePerBlock(), 32768);
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 6, 6, 4));
+
+    stream->kvCacheMutable().setBatchBlocks(0, "linear", BlockIndicesType(5, NULL_BLOCK_IDX));
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 6, 6, 4));
+}
+
+TEST_F(MtpCacheSnapshotCapacityTest, ChecksBothTableWidthsIndependently) {
+    auto config = makeCapacityConfig();
+    auto types  = test::publishedGroupTypes(config.topology());
+    auto stream = makeCapacityStream(config, /*seq_length=*/65537, {6, 1});
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 5, 6, 4));
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 6, 5, 4));
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 6, 6, 4));
+}
+
+TEST_F(MtpCacheSnapshotCapacityTest, BatchPaddingDoesNotExtendShortRequestsRow) {
+    auto config    = makeCapacityConfig();
+    auto types     = test::publishedGroupTypes(config.topology());
+    auto short_row = makeCapacityStream(config, /*seq_length=*/65537, {5, 1});
+    auto long_row  = makeCapacityStream(config, /*seq_length=*/65537, {64, 1});
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({long_row}, config, types, 64, 64, 4));
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({short_row, long_row}, config, types, 64, 64, 4));
+    short_row->kvCacheMutable().setBatchBlocks(0, "linear", BlockIndicesType(6, NULL_BLOCK_IDX));
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({short_row, long_row}, config, types, 64, 64, 4));
+}
+
+TEST_F(MtpCacheSnapshotCapacityTest, ChecksEachLinearGroupsOwnSpanAndRow) {
+    auto config = makeCapacityConfig(/*second_linear=*/true);
+    auto types  = test::publishedGroupTypes(config.topology());
+    auto stream = makeCapacityStream(config, /*seq_length=*/65537, {6, 5, 1});
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 6, 6, 4));
+    stream->kvCacheMutable().setBatchBlocks(0, "other_linear", BlockIndicesType(4, NULL_BLOCK_IDX));
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 6, 6, 4));
+}
+
+TEST_F(MtpCacheSnapshotCapacityTest, PendingCommitUsesPublishedBoundAndRequiresIt) {
+    auto config = makeCapacityConfig();
+    auto types  = test::publishedGroupTypes(config.topology());
+    auto stream = makeCapacityStream(config, /*seq_length=*/32768, {4, 1});
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 5, 5, 4));
+
+    GenerateStream::MtpAsyncDeviceState state;
+    state.next_seq_len_upper_bound = 32769;
+    stream->setMtpAsyncDeviceState(state);
+    stream->incPendingAsyncBookkeeping();
+    auto release_pending =
+        std::shared_ptr<void>(nullptr, [stream](void*) { stream->decPendingAsyncBookkeepingAndMaybeRelease(); });
+    // Host length still fits four slots, but the device-side sequence may
+    // already have crossed the checkpoint boundary and needs a fifth.
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 5, 5, 4));
+    stream->kvCacheMutable().setBatchBlocks(0, "linear", BlockIndicesType(5, NULL_BLOCK_IDX));
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 5, 5, 4));
+    state.next_seq_len_upper_bound = -1;
+    stream->setMtpAsyncDeviceState(state);
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 5, 5, 4));
+}
+
+TEST_F(MtpCacheSnapshotCapacityTest, FullAndReplayGroupsNeedNoProposalReserve) {
+    auto config = makeCapacityConfig();
+    auto stream = makeCapacityStream(config, /*seq_length=*/65537, {1, 1});
+    auto types  = test::publishedGroupTypes(config.topology());
+    EXPECT_FALSE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 1, 1, 4));
+    // dispatchDecodeAsync masks replay groups to FULL before checking capacity:
+    // their canonical row contains no per-proposal state slots.
+    config.linear_replay.group_ids = {0};
+    types[0]                       = CacheGroupType::FULL;
+    EXPECT_TRUE(MtpExecutor::hasLinearCacheSnapshotCapacity({stream}, config, types, 1, 1, 4));
 }
 
 }  // namespace rtp_llm

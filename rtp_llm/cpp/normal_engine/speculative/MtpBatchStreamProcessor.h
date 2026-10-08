@@ -47,21 +47,36 @@ public:
 
     absl::StatusOr<GptModelInputs> gatherDecodeModelInput(const StreamGroups& stream_groups,
                                                           TensorHolder&       host_holder) const;
+    absl::Status gatherLinearReplayInputs(const StreamGroups& stream_groups,
+                                          const CacheConfig& cache_config,
+                                          GptModelInputs& model_input,
+                                          TensorHolder& host_holder,
+                                          std::vector<GenerateStream::LinearReplayRound>& rounds) const;
 
     // Produce the next round's immutable page table by applying the exact
     // linear-cache permutation used by GenerateStream::specUpdate.  FULL/SWA
-    // groups are copied unchanged.  Keeping this operation tensor-native lets
-    // proposal/verify overlap host bookkeeping without a per-round D2H join.
+    // groups are copied unchanged. Each LINEAR group uses its own token span.
+    // Keeping this operation tensor-native lets proposal/verify overlap host
+    // bookkeeping without a per-round D2H join. Non-LINEAR spans may be zero.
     static torch::Tensor advanceLinearCacheBlockTable(const torch::Tensor&               current_table,
                                                       const torch::Tensor&               previous_seq_lengths,
                                                       const torch::Tensor&               accept_lengths,
                                                       const std::vector<CacheGroupType>& group_types,
-                                                      int64_t                            seq_size_per_block);
+                                                      const std::vector<int64_t>&        group_spans);
 
     absl::StatusOr<SamplerInputs> gatherSpecSamplerInput(const StreamGroups&                         stream_groups,
                                                          const GptModelOutputs&                      model_output,
                                                          const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
                                                          const torch::Tensor& draft_token_ids) const;
+
+    // CPU-only staging may overlap target verify. Finalization attaches GPU
+    // logits, processor masks and (when required) the current draft prefix.
+    SamplerInputs prepareSpecSamplerInputHost(const StreamGroups& stream_groups) const;
+    SamplerInputs finalizeSpecSamplerInput(const StreamGroups&                         stream_groups,
+                                           SamplerInputs                               sampler_inputs,
+                                           const GptModelOutputs&                      model_output,
+                                           const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
+                                           const torch::Tensor&                        draft_token_ids) const;
 
     void prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                       GptModelInputs&     model_input,

@@ -505,11 +505,19 @@ bool RtpLLMSpeculativeEngineMetrics::init(kmonitor::MetricsGroupManager* manager
     REGISTER_GAUGE_MUTABLE_METRIC(sp_avg_accept_rate_metric, "rtp_llm_sp_avg_accept_rate");
     REGISTER_GAUGE_MUTABLE_METRIC(sp_avg_fix_accept_rate_metric, "rtp_llm_sp_avg_fix_accept_rate");
     REGISTER_GAUGE_MUTABLE_METRIC(sp_estimate_tpot_us_metric, "rtp_llm_sp_estimate_tpot_us");
+    REGISTER_GAUGE_MUTABLE_METRIC(cycle_latency_us_metric, "rtp_llm_sp_cycle_latency_us");
     return true;
 }
 
 void RtpLLMSpeculativeEngineMetrics::report(const kmonitor::MetricsTags*             tags,
                                             RtpLLMSpeculativeEngineMetricsCollector* collector) {
+    if (collector->cycle_metrics_only) {
+        if (const auto tpot_us = collector->estimatedTpotUs()) {
+            REPORT_MUTABLE_METRIC(cycle_latency_us_metric, collector->cycle_latency_us);
+            REPORT_MUTABLE_METRIC(sp_estimate_tpot_us_metric, *tpot_us);
+        }
+        return;
+    }
     REPORT_MUTABLE_METRIC(step_latency_us_metric, collector->step_latency_us);
     REPORT_MUTABLE_METRIC(propose_step_latency_us_metric, collector->propose_step_latency_us);
     REPORT_MUTABLE_METRIC(score_step_latency_us_metric, collector->score_step_latency_us);
@@ -523,9 +531,6 @@ void RtpLLMSpeculativeEngineMetrics::report(const kmonitor::MetricsTags*        
         REPORT_MUTABLE_METRIC(sp_avg_accept_rate_metric, avg_accept_num / (collector->spec_steps + 1));
         if (collector->spec_steps > 0) {
             REPORT_MUTABLE_METRIC(sp_avg_fix_accept_rate_metric, (avg_accept_num - 1) / collector->spec_steps);
-        }
-        if (avg_accept_num > 0) {
-            REPORT_MUTABLE_METRIC(sp_estimate_tpot_us_metric, (double)collector->step_latency_us / avg_accept_num);
         }
     }
 }

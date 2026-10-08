@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -452,6 +454,140 @@ static GroupBase makeTestGroup(const KVCacheSpecPtr& spec, CacheGroupType type, 
     group.spec   = spec;
     group.policy = defaultCacheGroupPolicy(type);
     return group;
+}
+
+TEST(LinearReplayPlanTest, InvalidGeometryAndOverflowAreRejected) {
+    EXPECT_THROW(LinearReplayPlan::create({0}, 0, 4, {1, 2}, {1, 2}, false, DataType::TYPE_BF16, 1),
+                 std::invalid_argument);
+    EXPECT_THROW(LinearReplayPlan::create({0}, 1, 0, {1, 2}, {1, 2}, false, DataType::TYPE_BF16, 1),
+                 std::invalid_argument);
+    EXPECT_THROW(LinearReplayPlan::create({0}, 1, 4, {0, 2}, {1, 2}, false, DataType::TYPE_BF16, 1),
+                 std::invalid_argument);
+    EXPECT_THROW(LinearReplayPlan::create({0}, 1, 4, {1, 2}, {1, 2}, false, DataType::TYPE_INVALID, 1),
+                 std::invalid_argument);
+    EXPECT_THROW(LinearReplayPlan::create(
+                     {0}, std::numeric_limits<int64_t>::max(), 4, {1, 2}, {1, 2}, false, DataType::TYPE_BF16, 1),
+                 std::overflow_error);
+    EXPECT_THROW(LinearReplayPlan::create(
+                     {0}, 1, 4, {std::numeric_limits<int64_t>::max(), 4}, {1, 2}, false, DataType::TYPE_BF16, 1),
+                 std::overflow_error);
+}
+
+TEST(CacheConfigCreatorTest, LinearReplayAndDecodePoolAreDisabledByDefault) {
+    auto linear = makeTestGroup(std::make_shared<LinearKVCacheSpec>("linear", 16, 16, 1), CacheGroupType::LINEAR, {0});
+    const auto  original_policy = linear.policy;
+    CacheConfig config;
+    config.layer_num = 1;
+    config.setTopology({linear}, {{0, {"linear"}}});
+    ModelConfig       model;
+    ParallelismConfig parallelism;
+    parallelism.role_type = RoleType::DECODE;
+    RuntimeConfig runtime;
+    runtime.max_generate_batch_size = 7;
+    SpeculativeExecutionConfig speculative;
+    speculative.type              = SP_TYPE_MTP;
+    speculative.gen_num_per_cycle = 3;
+
+    EXPECT_FALSE(runtime.enable_linear_replay);
+    CacheConfigCreator::configureDecodeLinearPool(config, parallelism, runtime);
+    CacheConfigCreator::configureLinearReplay(config, model, parallelism, runtime, speculative, true);
+
+    EXPECT_EQ(config.group("linear").policy.explicit_block_num, original_policy.explicit_block_num);
+    EXPECT_EQ(config.group("linear").policy.charge_to_paged_budget, original_policy.charge_to_paged_budget);
+    EXPECT_TRUE(config.linear_replay.group_ids.empty());
+    EXPECT_EQ(config.linear_replay.slotCount(), 0);
+    EXPECT_EQ(config.linear_replay.maxSteps(), 0);
+    EXPECT_EQ(config.linear_replay.reserve_bytes, 0u);
+}
+
+TEST(CacheConfigCreatorTest, DecodeLinearPoolUsesConcurrencyForEveryDeviceLinearGroup) {
+    auto linear = makeTestGroup(std::make_shared<LinearKVCacheSpec>("linear_a", 16, 16, 1),
+                                CacheGroupType::LINEAR,
+                                {0});
+    auto other = makeTestGroup(std::make_shared<LinearKVCacheSpec>("linear_b", 16, 16, 1),
+                               CacheGroupType::LINEAR,
+                               {1});
+    other.policy.explicit_block_num = 19;
+    auto full = makeTestGroup(test::makeResolvedMhaSpec(DataType::TYPE_BF16, 1, 4, 16, "full"),
+                              CacheGroupType::FULL,
+                              {0});
+    CacheConfig config;
+    config.layer_num = 2;
+    config.setTopology({linear, other, full}, {{0, {"linear_a", "full"}}, {1, {"linear_b"}}});
+
+    ParallelismConfig parallelism;
+    parallelism.role_type = RoleType::DECODE;
+    RuntimeConfig runtime;
+    runtime.enable_linear_replay    = true;
+    runtime.max_generate_batch_size = 7;
+    CacheConfigCreator::configureDecodeLinearPool(config, parallelism, runtime);
+    EXPECT_EQ(config.group("linear_a").policy.explicit_block_num, 22u);  // 2 * (7 + 4)
+    EXPECT_TRUE(config.group("linear_a").policy.charge_to_paged_budget);
+    EXPECT_EQ(config.group("linear_b").policy.explicit_block_num, 19u);
+    EXPECT_EQ(config.group("full").policy.explicit_block_num, 0u);
+
+    parallelism.role_type = RoleType::PREFILL;
+    runtime.max_generate_batch_size = 15;
+    CacheConfigCreator::configureDecodeLinearPool(config, parallelism, runtime);
+    EXPECT_EQ(config.group("linear_a").policy.explicit_block_num, 22u);
+}
+
+TEST(CacheConfigCreatorTest, ReplaySelectsTargetLinearGroupsAndReservesLogMemory) {
+    auto target = makeTestGroup(std::make_shared<LinearKVCacheSpec>("target_linear", 16, 16, 1),
+                                CacheGroupType::LINEAR,
+                                {0});
+    auto draft = makeTestGroup(std::make_shared<LinearKVCacheSpec>("draft_linear", 16, 16, 1),
+                               CacheGroupType::LINEAR,
+                               {2});
+    auto full = makeTestGroup(test::makeResolvedMhaSpec(DataType::TYPE_BF16, 1, 4, 16, "full"),
+                              CacheGroupType::FULL,
+                              {1});
+    ModelConfig model;
+    auto& linear = model.linear_attention_config;
+    linear.linear_num_key_heads   = 8;
+    linear.linear_num_value_heads = 16;
+    linear.linear_key_head_dim    = 128;
+    linear.linear_value_head_dim  = 128;
+    linear.linear_conv_kernel_dim = 4;
+    linear.conv_state_dtype = DataType::TYPE_BF16;
+    ParallelismConfig parallelism;
+    parallelism.role_type = RoleType::DECODE;
+    RuntimeConfig runtime;
+    runtime.enable_linear_replay    = true;
+    runtime.max_generate_batch_size = 5;
+    SpeculativeExecutionConfig speculative;
+    speculative.type = SP_TYPE_MTP;
+    speculative.gen_num_per_cycle = 3;
+    for (const int64_t tp_size : {2, 4}) {
+        parallelism.tp_size = tp_size;
+        for (const bool vector_gate : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "tp_size=" << tp_size << ", vector_gate=" << vector_gate);
+            linear.replay_vector_gate = vector_gate;
+            CacheConfig config;
+            config.layer_num = 2;
+            config.setTopology({target, draft, full}, {{0, {"target_linear"}}, {1, {"full"}}, {2, {"draft_linear"}}});
+            CacheConfigCreator::configureLinearReplay(config, model, parallelism, runtime, speculative, true);
+            const auto&   plan        = config.linear_replay;
+            const int64_t key_heads   = 8 / tp_size;
+            const int64_t value_heads = 16 / tp_size;
+            const int64_t gate_dim    = vector_gate ? 128 : 1;
+            const int64_t channels    = 2 * key_heads * 128 + value_heads * 128;
+            EXPECT_EQ(plan.group_ids, (std::vector<int>{0}));
+            EXPECT_EQ(plan.slotCount(), 5);
+            EXPECT_EQ(plan.maxSteps(), 4);
+            EXPECT_EQ(plan.k_shape, (std::array<int64_t, 4>{5, 4, key_heads, 128}));
+            EXPECT_EQ(plan.u_shape, (std::array<int64_t, 4>{5, 4, value_heads, 128}));
+            EXPECT_EQ(plan.g_shape, (std::array<int64_t, 4>{5, 4, value_heads, gate_dim}));
+            EXPECT_EQ(plan.conv_input_shape, (std::array<int64_t, 3>{5, 4, channels}));
+            EXPECT_EQ(plan.conv_dtype, DataType::TYPE_BF16);
+            // One target layer of 4-step logs per slot; draft layers must not contribute.
+            const size_t values_per_step = key_heads * 128 + value_heads * 128 + value_heads * gate_dim;
+            EXPECT_EQ(plan.reserve_bytes,
+                      5u
+                          * (2u * sizeof(int64_t) + 2u * sizeof(int32_t)
+                             + 4u * (values_per_step * sizeof(float) + channels * sizeof(uint16_t))));
+        }
+    }
 }
 
 TEST(CacheConfigTest, GroupIdentityQueriesPreserveGeometryAcrossTopologyOrders) {
