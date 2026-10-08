@@ -107,6 +107,8 @@ enum GptModelInputIndex : size_t {
     skipRun,
     gptModelRequestLength,  // length of request id & pd_separation
     isFakeStream,
+    linearReplayBatch,
+    linearReplayGroups,
     // last_hidden_states can have a different row count from combo_tokens for
     // DSpARK prefill seeding, so transmit its leading dimension explicitly.
     mtpHiddenStatesRows,
@@ -209,6 +211,7 @@ public:
     virtual std::optional<std::string> takeDeferredHiddenStateCaptureError() {
         return std::nullopt;
     }
+    virtual void invalidatePreparedAttentionInputs() {}
 
     // Refresh only kv_cache_kernel_block_id-dependent state on a previously-
     // prepared attention_inputs_ (e.g., after an MTP propose+verify re-gather).

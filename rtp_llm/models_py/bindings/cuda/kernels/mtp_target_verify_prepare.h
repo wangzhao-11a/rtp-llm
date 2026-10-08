@@ -12,7 +12,9 @@ void invokeMtpTargetVerifyPrepare(const torch::Tensor& sequence_lengths,
                                   torch::Tensor&       sequence_lengths_plus_1,
                                   torch::Tensor&       lm_output_indexes,
                                   int32_t              tokens_per_batch,
-                                  cudaStream_t         stream);
+                                  cudaStream_t         stream,
+                                  const torch::Tensor* position_bases = nullptr,
+                                  torch::Tensor*       position_ids   = nullptr);
 
 void invokeMtpSpecDecodeMetadataPrepare(torch::Tensor& input_lengths,
                                         torch::Tensor& lm_output_indexes,

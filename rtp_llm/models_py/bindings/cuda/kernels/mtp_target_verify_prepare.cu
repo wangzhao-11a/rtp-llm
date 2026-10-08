@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <c10/cuda/CUDAException.h>
 
 namespace rtp_llm {
 
@@ -15,7 +16,10 @@ __global__ void mtpTargetVerifyPrepareKernel(const int32_t* __restrict__ sequenc
                                              int32_t* __restrict__ sequence_lengths_plus_1,
                                              int32_t* __restrict__ lm_output_indexes,
                                              int32_t tokens_per_batch,
-                                             int32_t batch_size) {
+                                             int32_t batch_size,
+                                             const int32_t* __restrict__ position_bases,
+                                             int32_t* __restrict__ position_ids,
+                                             int32_t position_factor) {
     const int32_t idx = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= batch_size) {
         return;
@@ -24,6 +28,15 @@ __global__ void mtpTargetVerifyPrepareKernel(const int32_t* __restrict__ sequenc
     prefix_lengths[idx]          = sequence_lengths[idx];
     sequence_lengths_plus_1[idx] = sequence_lengths[idx] + 1;
     lm_output_indexes[idx]       = idx * tokens_per_batch;
+    if (position_ids != nullptr) {
+        for (int32_t q = 0; q < tokens_per_batch; ++q) {
+            for (int32_t f = 0; f < position_factor; ++f) {
+                const auto base = position_bases[static_cast<int64_t>(idx) * position_factor + f];
+                position_ids[(static_cast<int64_t>(idx) * tokens_per_batch + q) * position_factor + f] =
+                    static_cast<int32_t>(static_cast<uint32_t>(base) + static_cast<uint32_t>(q));
+            }
+        }
+    }
 }
 
 __global__ void mtpSpecDecodeMetadataPrepareKernel(int32_t* __restrict__ input_lengths,
@@ -149,7 +162,9 @@ void invokeMtpTargetVerifyPrepare(const torch::Tensor& sequence_lengths,
                                   torch::Tensor&       sequence_lengths_plus_1,
                                   torch::Tensor&       lm_output_indexes,
                                   int32_t              tokens_per_batch,
-                                  cudaStream_t         stream) {
+                                  cudaStream_t         stream,
+                                  const torch::Tensor* position_bases,
+                                  torch::Tensor*       position_ids) {
     const int64_t batch_size = input_lengths.numel();
     if (batch_size <= 0) {
         return;
@@ -159,16 +174,36 @@ void invokeMtpTargetVerifyPrepare(const torch::Tensor& sequence_lengths,
     checkCudaI32Vector(prefix_lengths, "prefix_lengths", batch_size);
     checkCudaI32Vector(sequence_lengths_plus_1, "sequence_lengths_plus_1", batch_size);
     checkCudaI32Vector(lm_output_indexes, "lm_output_indexes", batch_size);
+    RTP_LLM_CHECK_WITH_INFO((position_bases == nullptr) == (position_ids == nullptr),
+                            "MTP target position bases and output must be provided together");
+    int32_t position_factor = 0;
+    if (position_bases != nullptr) {
+        RTP_LLM_CHECK_WITH_INFO(tokens_per_batch > 0 && position_bases->numel() % batch_size == 0
+                                    && position_bases->numel() / batch_size <= INT_MAX,
+                                "MTP target position bases must have one tuple per request");
+        position_factor = static_cast<int32_t>(position_bases->numel() / batch_size);
+        RTP_LLM_CHECK_WITH_INFO(position_factor > 0, "MTP target position factor must be positive");
+        checkCudaI32Vector(*position_bases, "position_bases", batch_size * position_factor);
+        checkCudaI32Vector(*position_ids, "position_ids", batch_size * tokens_per_batch * position_factor);
+        RTP_LLM_CHECK_WITH_INFO(position_bases->device() == sequence_lengths.device()
+                                    && position_ids->device() == sequence_lengths.device(),
+                                "MTP target positions and sequence lengths must use the same device");
+    }
 
     constexpr int block_size = 256;
     const int     grid_size  = static_cast<int>((batch_size + block_size - 1) / block_size);
-    mtpTargetVerifyPrepareKernel<<<grid_size, block_size, 0, stream>>>(sequence_lengths.data_ptr<int32_t>(),
-                                                                       input_lengths.data_ptr<int32_t>(),
-                                                                       prefix_lengths.data_ptr<int32_t>(),
-                                                                       sequence_lengths_plus_1.data_ptr<int32_t>(),
-                                                                       lm_output_indexes.data_ptr<int32_t>(),
-                                                                       tokens_per_batch,
-                                                                       static_cast<int32_t>(batch_size));
+    mtpTargetVerifyPrepareKernel<<<grid_size, block_size, 0, stream>>>(
+        sequence_lengths.data_ptr<int32_t>(),
+        input_lengths.data_ptr<int32_t>(),
+        prefix_lengths.data_ptr<int32_t>(),
+        sequence_lengths_plus_1.data_ptr<int32_t>(),
+        lm_output_indexes.data_ptr<int32_t>(),
+        tokens_per_batch,
+        static_cast<int32_t>(batch_size),
+        position_bases ? position_bases->data_ptr<int32_t>() : nullptr,
+        position_ids ? position_ids->data_ptr<int32_t>() : nullptr,
+        position_factor);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void invokeMtpSpecDecodeMetadataPrepare(torch::Tensor& input_lengths,
