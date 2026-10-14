@@ -232,6 +232,12 @@ class KimiK3Model(GptModelBase):
             py_hw_kernel_config,
             device_resource_config,
         )
+        # Page-RR decode/verify/update use device metadata throughout. Prompt
+        # prefill retains its host convolution and attention metadata contract.
+        self.device_only_decode_attention_metadata = bool(
+            parallelism_config.tp_size > 1
+            and parallelism_config.prefill_cp_config.kv_cache_sharded
+        )
         self.tp_size, self.tp_rank = (
             parallelism_config.tp_size,
             parallelism_config.tp_rank,

@@ -54,6 +54,7 @@ public:
                     std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter    = nullptr):
         GraphBase(std::move(py_instance)),
         enable_cuda_graph_(graph_params.enable_cuda_graph),
+        device_only_attention_metadata_(graph_params.device_only_attention_metadata),
         is_prefill_cuda_graph_mode_(graph_params.is_prefill_cuda_graph_mode),
         is_target_verify_(graph_params.is_target_verify),
         role_(graph_params.role),
@@ -66,6 +67,7 @@ public:
         hidden_size_(graph_params.hidden_size),
         input_hidden_size_(graph_params.input_hidden_size),
         hc_mult_(static_cast<int>(graph_params.hc_mult)),
+        fixed_capacity_mtp_draft_prefill_(graph_params.fixed_capacity_mtp_draft_prefill),
         prefill_capture_seq_lens_(graph_params.prefill_capture_seq_lens),
         decode_capture_batch_sizes_(graph_params.decode_capture_batch_sizes),
         position_encoding_(graph_params.position_encoding),
@@ -167,9 +169,14 @@ public:
     void           capturePrefillOneSeqLen(int seq_len);
     void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state);
     void           prepareInputData(const PyModelInputs& inputs, CudaGraphState& state);
+    bool           canStageUnpaddedInputs(const torch::Tensor& input_ids, const torch::Tensor& input_hiddens) const;
     void           prepareAttentionInputs(const PyModelInputs& inputs,
                                           CudaGraphState&      state,
                                           bool                 skip_forward_event_sync = false) override;
+    bool           tryPrepareDecodeAttentionInputs(PyModelInputs&  inputs,
+                                                   CudaGraphState& state,
+                                                   bool            skip_forward_event_sync,
+                                                   bool            is_fake_stream) override;
     void           updateKVCacheKernelBlockId(const PyModelInputs& inputs, CudaGraphState& state) override;
     bool           canRun(const PyModelInputs& inputs,
                           CudaGraphState&      state,
@@ -191,6 +198,11 @@ public:
     static CudaGraphRunner* initializeCapture(std::unique_ptr<CudaGraphRunner> runner);
 
 private:
+    void prepareAttentionInputsImpl(const PyModelInputs& inputs,
+                                    CudaGraphState&      state,
+                                    bool                 skip_forward_event_sync,
+                                    bool                 build_decode_metadata,
+                                    bool                 is_fake_stream);
     // Common capture logic for both prefill and decode
     void captureOneGraphInstance(int key, const char* key_type);
     // Common replay and sync check logic
@@ -206,12 +218,18 @@ private:
         return role_ == CudaGraphRole::GENERATION_PREFILL;
     }
     bool usesFixedCapacityMtpDraftPrefillCudaGraph() const {
-        // DSpARK propose/commit now run as construction-time-role decode graphs
-        // (is_prefill_cuda_graph_mode_ == false), so only the HC-shaped MTP draft
-        // prefill keeps the fixed-capacity Python path: slicing its output buffer
-        // would mismatch the forward_decode [B * q_len, dim] result in
-        // captureOneGraphInstance.
-        return isMtpDraftPrefillCudaGraph() && hc_mult_ > 1;
+        // DSpARK propose/commit run as decode graphs. HC-shaped drafts and
+        // rectangular draft attention require a fixed B*Q shape per graph.
+        return isMtpDraftPrefillCudaGraph() && (hc_mult_ > 1 || fixed_capacity_mtp_draft_prefill_);
+    }
+    int mtpDraftPrefillBatchCapacity(int tokens) const {
+        if (!usesFixedCapacityMtpDraftPrefillCudaGraph())
+            return static_cast<int>(max_bs_);
+        const int alignment = sequence_parallel_size_ / std::gcd(sequence_parallel_size_, num_tokens_per_bs_);
+        const int requests  = (tokens + num_tokens_per_bs_ - 1) / num_tokens_per_bs_;
+        const int rounded   = (requests + alignment - 1) / alignment * alignment;
+        RTP_LLM_CHECK_WITH_INFO(rounded <= static_cast<int>(max_bs_), "MTP bucket exceeds request capacity");
+        return rounded;
     }
     // Common input preparation logic for capture
     void prepareCaptureInputs(PyModelInputs& inputs, int batch_size, int seq_len_or_tokens);
@@ -243,6 +261,7 @@ private:
     py::object              py_forward_method_;
     py::object              py_attn_pyobj_method_;
     bool                    enable_cuda_graph_{false};
+    bool                    device_only_attention_metadata_{false};
     bool                    is_prefill_cuda_graph_mode_{false};
     bool                    is_target_verify_{false};
     CudaGraphRole           role_{CudaGraphRole::AUTO};
@@ -258,6 +277,7 @@ private:
     int                     hidden_size_{0};
     size_t                  input_hidden_size_{0};
     int                     hc_mult_{1};
+    bool                    fixed_capacity_mtp_draft_prefill_{false};
     std::vector<int>        capture_range_;
     std::vector<int>        prefill_capture_seq_lens_;    // Pre-configured sequence lengths from Python
     std::vector<int>        decode_capture_batch_sizes_;  // Pre-configured batch sizes from Python

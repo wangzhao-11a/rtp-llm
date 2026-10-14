@@ -319,6 +319,7 @@ def _prepare_decode_metadata(
     request_count: tl.constexpr,
     has_valid_mask: tl.constexpr,
     block: tl.constexpr,
+    table_block: tl.constexpr = 128,
 ):
     if mtp_update:
         # One program prepares a physical query and its complete page table.
@@ -336,6 +337,19 @@ def _prepare_decode_metadata(
         active = valid
         batch = row // queries
         query_offset = row % queries
+        column = tl.program_id(1) * table_block + tl.arange(0, table_block)
+        page = tl.load(
+            table + batch[:, None] * table_stride + column[None, :],
+            valid[:, None] & (column[None, :] < table_width), other=0,
+        )
+        width = tl.maximum(table_width, 1)
+        tl.store(
+            query_tables + row[:, None] * width + column[None, :], page,
+            valid[:, None] & (column[None, :] < width),
+        )
+        # Other column tiles only copy their disjoint part of the page table.
+        valid = valid & (tl.program_id(1) == 0)
+        active = valid
     base = tl.load(sequence_base + batch, active, other=0)
     if graph_decode:
         # CudaGraphRunner's synthetic q1 capture leaves plus_1 at zero.

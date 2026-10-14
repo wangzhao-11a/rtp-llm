@@ -386,6 +386,9 @@ struct PyModelInputs {
 
     // Internal homogeneous-batch signal; not part of the Generate RPC/config surface.
     bool capture_hidden_states = false;
+    // C++ staging contract: payload rows are logical; attention metadata owns
+    // the physical SP geometry. Set only after validating the source tensors.
+    bool input_payload_unpadded = false;
 
     bool hasAttentionInputsByTag() const {
         return !attention_inputs_by_tag.empty();
