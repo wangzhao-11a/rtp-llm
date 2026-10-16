@@ -60,10 +60,6 @@ PPSamplingPlan PPBatchStreamProcessor::gatherSamplingPlan(const StreamGroups& st
 
     int64_t total_batch_size = 0;
     for (const auto& stream : all_streams) {
-        RTP_LLM_CHECK_WITH_INFO(!stream->hasNumBeams(),
-                                "PP sampling does not support beam search, "
-                                "request_id=%ld",
-                                stream->streamId());
         total_batch_size += stream->currentBatchSize();
     }
 

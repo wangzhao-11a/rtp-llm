@@ -11,9 +11,9 @@
  * Add cases beside the interface they exercise; keep ordinary, speculative and PD
  * variants in that group. Supply legal stream/plan data and model/sampler outputs
  * directly, then check the interface's outputs and stream changes.
- * Stage orchestration, model/draft execution and communication waits belong in
- * PPExecutorTest; serialization belongs in PPSerializationTest. Real multi-stage
- * communication and overlap belong to smoke tests.
+ * Request validation, stage orchestration, model/draft execution and communication
+ * waits belong in PPExecutorTest; serialization belongs in PPSerializationTest.
+ * Real multi-stage communication and overlap belong to smoke tests.
  */
 
 #include <algorithm>
@@ -281,14 +281,6 @@ TEST_F(PPBatchStreamProcessorTest, SamplingPlanCarriesSpeculativeFlagsPerRequest
     }
 }
 
-TEST_F(PPBatchStreamProcessorTest, SamplingPlanRejectsUnsupportedBeamSearch) {
-    auto cfg = config();
-    cfg.num_beams = 2;
-    auto stream = makeStream(101, {1, 2}, cfg);
-    auto processor = makeProcessor();
-    EXPECT_THROW(processor.gatherSamplingPlan(StreamGroups({stream})), std::runtime_error);
-}
-
 TEST_F(PPBatchStreamProcessorTest, OutputConfigCombinesFlagsAndKeepsPromptRequestsSeparate) {
     auto first_config = config();
     first_config.return_logits            = true;
@@ -328,17 +320,30 @@ TEST_F(PPBatchStreamProcessorTest, OutputConfigCombinesFlagsAndKeepsPromptReques
     EXPECT_EQ(processor.gatherOutputConfig(groups).return_all_probs, ReturnAllProbsMode::ORIGINAL);
     second->setReturnAllProbs(ReturnAllProbsMode::NONE);
     EXPECT_EQ(processor.gatherOutputConfig(groups).return_all_probs, ReturnAllProbsMode::NONE);
-    auto speculative = makeProcessor(SP_TYPE_MTP);
-    second->setReturnAllProbs(ReturnAllProbsMode::DEFAULT);
-    const auto speculative_output = speculative.gatherOutputConfig(groups);
-    EXPECT_FALSE(speculative_output.return_logits);
-    EXPECT_FALSE(speculative_output.return_hidden_states);
-    EXPECT_FALSE(speculative_output.return_all_hidden_states);
-    EXPECT_EQ(speculative_output.return_all_probs, ReturnAllProbsMode::NONE);
-    EXPECT_FALSE(speculative_output.return_cum_log_probs);
-    EXPECT_TRUE(speculative_output.return_softmax_probs);
-    EXPECT_TRUE(speculative_output.calculate_loss);
-    EXPECT_TRUE(speculative_output.prompt_logits_requests[0].enabled);
+}
+
+TEST_F(PPBatchStreamProcessorTest, SpeculativeOutputConfigDisablesPerStepOutputs) {
+    auto cfg = config();
+    cfg.return_logits = true;
+    cfg.return_hidden_states = true;
+    cfg.return_all_hidden_states = true;
+    cfg.return_cum_log_probs = true;
+    cfg.return_all_probs = ReturnAllProbsMode::DEFAULT;
+    auto stream = makeStream(101, {1, 2}, cfg);
+    for (auto type : {SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
+        SCOPED_TRACE(type);
+        auto processor = makeProcessor(type);
+        const auto output = processor.gatherOutputConfig(StreamGroups({stream}));
+        EXPECT_FALSE(output.return_logits);
+        EXPECT_FALSE(output.return_hidden_states);
+        EXPECT_FALSE(output.return_all_hidden_states);
+        EXPECT_FALSE(output.return_cum_log_probs);
+        EXPECT_EQ(output.return_all_probs, ReturnAllProbsMode::NONE);
+        EXPECT_FALSE(output.return_softmax_probs);
+        EXPECT_FALSE(output.calculate_loss);
+        ASSERT_EQ(output.prompt_logits_requests.size(), 1u);
+        EXPECT_FALSE(output.prompt_logits_requests[0].enabled);
+    }
 }
 
 /** 2. Tail sampling states: registration, preservation and PD history replay are request-local. */
@@ -779,21 +784,19 @@ TEST_F(PPBatchStreamProcessorTest, FillResultCommitsLastSampleAndCopiesRequested
     EXPECT_TRUE(result.request_errors[1].ok());
 }
 
-TEST_F(PPBatchStreamProcessorTest, FillResultKeepsSpeculativeVerifyRowsPerStream) {
-    auto cfg = config();
-    cfg.return_softmax_probs = true;
-    cfg.return_cum_log_probs = true;
-    cfg.calculate_loss       = 2;
-    auto first  = makeStream(101, {1, 2}, cfg);
-    auto second = makeStream(202, {3}, cfg);
-    auto third  = makeStream(303, {4}, cfg);
+TEST_F(PPBatchStreamProcessorTest, FillResultKeepsSpeculativeVerifyRowsForExplicitOutputPlan) {
+    auto first  = makeStream(101, {1, 2});
+    auto second = makeStream(202, {3});
+    auto third  = makeStream(303, {4});
     StreamGroups groups({first, second, third});
     auto processor = makeProcessor(SP_TYPE_MTP);
     PPExecutionPlan plan;
     plan.is_decode     = true;
     plan.sampling_plan = processor.gatherSamplingPlan(groups);
     plan.output_config = processor.gatherOutputConfig(groups);
-    /** Verify must skip prompt loss even with need_all_logits. */
+    /** Enable both flags to check probability row indexing and verify that prompt loss stays empty. */
+    plan.output_config.return_softmax_probs = true;
+    plan.output_config.calculate_loss = true;
     plan.model_input.need_all_logits = true;
 
     /** K = 2: three logits rows per stream. */

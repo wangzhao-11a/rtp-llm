@@ -3,6 +3,7 @@
 #include <functional>
 #include <list>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -112,6 +113,8 @@ private:
     void waitLastRun();
 
     void releaseAllModelBuffers();
+
+    std::optional<ErrorInfo> validateStream(const GenerateStream& stream) const;
 
     void prepareStreams(std::list<GenerateStreamPtr>& streams);
 

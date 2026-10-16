@@ -603,54 +603,67 @@ absl::Status PPExecutor::warmUp(const ScheduleOutput& schedule_output) {
     return absl::OkStatus();
 }
 
+std::optional<ErrorInfo> PPExecutor::validateStream(const GenerateStream& stream) const {
+    const auto& config = *stream.generateConfig();
+    if (stream.hasNumBeams()) {
+        return ErrorInfo(ErrorCode::INVALID_PARAMS, "PP does not support beam search");
+    }
+    if (config.calculate_loss != 0) {
+        return ErrorInfo(ErrorCode::INVALID_PARAMS, "PP does not support calculate_loss");
+    }
+    if (sp_enabled_ && (config.return_softmax_probs || config.return_prompt_logits)) {
+        return ErrorInfo(ErrorCode::INVALID_PARAMS,
+                         "PP speculative decoding does not support return_softmax_probs or return_prompt_logits");
+    }
+    /** Prefill-only requests do not run the sampler. */
+    if (sp_enabled_ && !config.isPrefillOnly()) {
+        if (is_dspark_ && stream.maxBatchSize() != 1) {
+            return ErrorInfo(ErrorCode::INVALID_PARAMS, "PP DSpARK does not support tiled sampling");
+        }
+        if (auto error = LogitsProcessorFactory::validateMtpCompatibility(stream.getAllLogitsProcessorPtr());
+            error.has_value()) {
+            return error;
+        }
+    }
+    return std::nullopt;
+}
+
 void PPExecutor::prepareStreams(std::list<GenerateStreamPtr>& streams) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.prepare_streams");
-    if (!sp_enabled_) {
-        return;
-    }
-
     const auto token_count = static_cast<int64_t>(propose_step_ + 1);
     for (auto it = streams.begin(); it != streams.end();) {
         const auto& stream = *it;
-        if (stream->generateConfig()->isPrefillOnly()) {
-            /** Match MtpExecutor: prefill-only does not require speculative sampling admission. */
-            ++it;
-            continue;
-        }
-        if (is_dspark_) {
-            RTP_LLM_CHECK_WITH_INFO(stream->maxBatchSize() == 1,
-                                    "PP DSpARK does not support tiled sampling, request_id=%ld",
-                                    stream->streamId());
-        }
-        auto error = LogitsProcessorFactory::validateMtpCompatibility(stream->getAllLogitsProcessorPtr());
-        if (error.has_value()) {
+        if (auto error = validateStream(*stream); error.has_value()) {
             stream->reportError(error->code(), error->ToString());
             /** The scheduler marked this request in flight, but no plan will carry it. */
             stream->clearPPInflight();
             it = streams.erase(it);
             continue;
         }
-        auto       sp_output_buffer = stream->getSPOutputBuffer();
-        const bool is_fake_stream   = stream->isFakeStream() || stream->isPerfTest();
-        if (!sp_output_buffer) {
-            RTP_LLM_CHECK_WITH_INFO(stream->isContextStream() || is_fake_stream,
-                                    "PP speculative decode requires proposal tokens, request_id=%ld",
-                                    stream->streamId());
-            sp_output_buffer         = std::make_shared<SpeculativeExecutorStreamOutput>();
-            sp_output_buffer->tokens = torch::zeros({1, token_count}, torch::kInt32);
-            stream->setSPOutputBuffer(sp_output_buffer);
-        } else if (is_fake_stream
-                   && (!sp_output_buffer->tokens.defined() || sp_output_buffer->tokens.numel() != token_count)) {
-            sp_output_buffer->tokens = torch::zeros({1, token_count}, torch::kInt32);
+        if (sp_enabled_ && !stream->generateConfig()->isPrefillOnly()) {
+            auto       sp_output_buffer = stream->getSPOutputBuffer();
+            const bool is_fake_stream   = stream->isFakeStream() || stream->isPerfTest();
+            if (!sp_output_buffer) {
+                /** Real decode streams must carry the token buffer from the previous step or PD admission. */
+                RTP_LLM_CHECK_WITH_INFO(stream->isContextStream() || is_fake_stream,
+                                        "PP speculative decode requires proposal tokens, request_id=%ld",
+                                        stream->streamId());
+                sp_output_buffer         = std::make_shared<SpeculativeExecutorStreamOutput>();
+                sp_output_buffer->tokens = torch::zeros({1, token_count}, torch::kInt32);
+                stream->setSPOutputBuffer(sp_output_buffer);
+            } else if (is_fake_stream
+                       && (!sp_output_buffer->tokens.defined() || sp_output_buffer->tokens.numel() != token_count)) {
+                sp_output_buffer->tokens = torch::zeros({1, token_count}, torch::kInt32);
+            }
+            RTP_LLM_CHECK_WITH_INFO(
+                sp_output_buffer->tokens.defined() && sp_output_buffer->tokens.device().is_cpu()
+                    && sp_output_buffer->tokens.scalar_type() == torch::kInt32 && sp_output_buffer->tokens.is_contiguous()
+                    && sp_output_buffer->tokens.numel() == token_count,
+                "PP speculative token buffer must contain one target token and %zu draft tokens, request_id=%ld",
+                propose_step_,
+                stream->streamId());
+            sp_output_buffer->propose_step = propose_step_;
         }
-        RTP_LLM_CHECK_WITH_INFO(
-            sp_output_buffer->tokens.defined() && sp_output_buffer->tokens.device().is_cpu()
-                && sp_output_buffer->tokens.scalar_type() == torch::kInt32 && sp_output_buffer->tokens.is_contiguous()
-                && sp_output_buffer->tokens.numel() == token_count,
-            "PP speculative token buffer must contain one target token and %zu draft tokens, request_id=%ld",
-            propose_step_,
-            stream->streamId());
-        sp_output_buffer->propose_step = propose_step_;
         ++it;
     }
 }

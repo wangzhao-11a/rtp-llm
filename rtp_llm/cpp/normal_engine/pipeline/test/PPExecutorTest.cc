@@ -578,21 +578,30 @@ protected:
                                         const ModelConfig&     model_config,
                                         int64_t                request_id,
                                         std::vector<int32_t>   input_ids,
-                                        int32_t                num_return_sequences,
-                                        int32_t                max_new_tokens = 20) {
+                                        const GenerateConfig&  config) {
         auto input                                   = std::make_shared<GenerateInput>();
         input->request_id                            = request_id;
         input->input_ids                             = intTensor(std::move(input_ids));
-        input->generate_config                       = std::make_shared<GenerateConfig>();
-        input->generate_config->num_return_sequences = num_return_sequences;
-        input->generate_config->max_new_tokens       = max_new_tokens;
-        input->generate_config->do_sample            = false;
+        input->generate_config                       = std::make_shared<GenerateConfig>(config);
 
         RuntimeConfig runtime_config;
         auto          stream =
             std::make_shared<NormalGenerateStream>(input, model_config, runtime_config, resource_context, nullptr);
         stream->generate_status_->status = StreamState::RUNNING;
         return stream;
+    }
+
+    static GenerateStreamPtr makeStream(const ResourceContext& resource_context,
+                                        const ModelConfig&     model_config,
+                                        int64_t                request_id,
+                                        std::vector<int32_t>   input_ids,
+                                        int32_t                num_return_sequences,
+                                        int32_t                max_new_tokens = 20) {
+        GenerateConfig config;
+        config.num_return_sequences = num_return_sequences;
+        config.max_new_tokens = max_new_tokens;
+        config.do_sample = false;
+        return makeStream(resource_context, model_config, request_id, std::move(input_ids), config);
     }
 
     static EngineInitParams makeStageParams(int pp_rank, SpeculativeType type = SP_TYPE_NONE, int64_t width = 3) {
@@ -1657,7 +1666,7 @@ TEST_F(PPExecutorTest, FirstEmptyExecutionStillDispatchesThePreviousBatchOutside
     }
 }
 
-/** First-stage additions: PD handoff, speculative admission and TP ownership. */
+/** First: PD handoff, request validation and TP ownership. */
 TEST_F(PPExecutorTest, FirstPdDecodeUsesPreparedCandidatesWithoutOverwritingThem) {
     for (auto type : {SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
         SCOPED_TRACE(type);
@@ -1689,6 +1698,193 @@ TEST_F(PPExecutorTest, FirstPdDecodeUsesPreparedCandidatesWithoutOverwritingThem
         EXPECT_EQ(stream->getSPOutputBuffer(), buffer);
         EXPECT_TRUE(torch::equal(buffer->tokens, before));
         EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 7}));
+    }
+}
+
+TEST_F(PPExecutorTest, FirstAdmissionRejectsBeamSearchBeforeForward) {
+    for (auto type : {SP_TYPE_NONE, SP_TYPE_MTP}) {
+        SCOPED_TRACE(type);
+        auto params = makeStageParams(0, type);
+        PPExecutor executor(params, nullptr, false);
+        auto* wire = attachTransport(executor);
+        auto* recorded = installModel<RecordingDraftModel>(executor);
+        std::vector<GenerateStreamPtr> rejected;
+        for (bool variable : {false, true}) {
+            GenerateConfig config;
+            config.max_new_tokens = 20;
+            if (variable) {
+                config.variable_num_beams = {1, 2};
+            } else {
+                config.num_beams = 2;
+            }
+            auto stream = makeStream(ResourceContext{}, params.model_config_, variable ? 202 : 101, {1, 2}, config);
+            stream->setPPInflight();
+            rejected.push_back(stream);
+        }
+        auto healthy = makeStream(ResourceContext{}, params.model_config_, 303, {3, 4}, 1);
+        healthy->setPPInflight();
+
+        ASSERT_TRUE(executor.process(ScheduleOutput{{rejected[0], rejected[1], healthy}}).ok());
+
+        for (const auto& stream : rejected) {
+            EXPECT_TRUE(stream->hasError());
+            EXPECT_EQ(stream->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+            EXPECT_NE(stream->statusInfo().ToString().find("beam search"), std::string::npos);
+            EXPECT_FALSE(stream->isPPInflight());
+            EXPECT_FALSE(stream->getSPOutputBuffer());
+        }
+        EXPECT_FALSE(healthy->hasError());
+        EXPECT_TRUE(healthy->isPPInflight());
+        ASSERT_EQ(recorded->inputs.size(), 1u);
+        const auto plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
+        EXPECT_EQ(tensorToVector<int64_t>(plan.sampling_plan.request_ids), std::vector<int64_t>{303});
+    }
+}
+
+TEST_F(PPExecutorTest, FirstAdmissionRejectsLossWithoutDiscardingHealthyRequests) {
+    for (auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
+        SCOPED_TRACE(type);
+        auto params = makeStageParams(0, type);
+        PPExecutor executor(params, nullptr, false);
+        auto* wire = attachTransport(executor);
+        auto* recorded = installModel<RecordingDraftModel>(executor);
+        std::list<GenerateStreamPtr> streams;
+        for (int loss_mode : {1, 2}) {
+            GenerateConfig config;
+            config.max_new_tokens = 20;
+            config.calculate_loss = loss_mode;
+            auto stream = makeStream(ResourceContext{}, params.model_config_, 100 + loss_mode, {1, 2}, config);
+            stream->setPPInflight();
+            streams.push_back(stream);
+        }
+        auto healthy = makeStream(ResourceContext{}, params.model_config_, 202, {3, 4}, 1);
+        healthy->setPPInflight();
+        streams.push_back(healthy);
+
+        ASSERT_TRUE(executor.process(ScheduleOutput{streams}).ok());
+
+        for (const auto& stream : streams) {
+            if (stream == healthy) {
+                continue;
+            }
+            EXPECT_EQ(stream->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+            EXPECT_NE(stream->statusInfo().ToString().find("calculate_loss"), std::string::npos);
+            EXPECT_FALSE(stream->isPPInflight());
+            EXPECT_FALSE(stream->getSPOutputBuffer());
+        }
+        EXPECT_FALSE(healthy->hasError());
+        EXPECT_TRUE(healthy->isPPInflight());
+        ASSERT_EQ(recorded->inputs.size(), 1u);
+        const auto plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
+        EXPECT_EQ(tensorToVector<int64_t>(plan.sampling_plan.request_ids), std::vector<int64_t>{202});
+        EXPECT_FALSE(plan.output_config.calculate_loss);
+    }
+}
+
+TEST_F(PPExecutorTest, FirstAdmissionAllowsOptionalOutputsOnlyWithoutSpeculation) {
+    for (auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
+        for (bool prompt_logits : {false, true}) {
+            SCOPED_TRACE(testing::Message() << "type=" << type << ", prompt_logits=" << prompt_logits);
+            auto params = makeStageParams(0, type);
+            PPExecutor executor(params, nullptr, false);
+            auto* wire = attachTransport(executor);
+            auto* recorded = installModel<RecordingDraftModel>(executor);
+            GenerateConfig config;
+            config.max_new_tokens = 20;
+            config.return_prompt_logits = prompt_logits;
+            config.return_softmax_probs = !prompt_logits;
+            auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, config);
+            stream->setPPInflight();
+
+            ASSERT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
+
+            const auto plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
+            if (type == SP_TYPE_NONE) {
+                EXPECT_FALSE(stream->hasError());
+                EXPECT_TRUE(stream->isPPInflight());
+                EXPECT_FALSE(plan.model_input.skip_run);
+                EXPECT_EQ(recorded->inputs.size(), 1u);
+                EXPECT_EQ(plan.output_config.return_softmax_probs, !prompt_logits);
+                ASSERT_EQ(plan.output_config.prompt_logits_requests.size(), 1u);
+                EXPECT_EQ(plan.output_config.prompt_logits_requests[0].enabled, prompt_logits);
+            } else {
+                EXPECT_EQ(stream->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+                EXPECT_NE(stream->statusInfo().ToString().find(
+                              prompt_logits ? "return_prompt_logits" : "return_softmax_probs"),
+                          std::string::npos);
+                EXPECT_FALSE(stream->isPPInflight());
+                EXPECT_FALSE(stream->getSPOutputBuffer());
+                EXPECT_TRUE(plan.model_input.skip_run);
+                EXPECT_TRUE(recorded->inputs.empty());
+                EXPECT_FALSE(executor.slots_[0].result_pending);
+                ASSERT_TRUE(executor.drainPendingResults().ok());
+                EXPECT_EQ(wire->receive_index, 0u);
+            }
+        }
+    }
+}
+
+TEST_F(PPExecutorTest, FirstAdmissionRejectsTiledSamplingWithSpeculation) {
+    for (auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
+        SCOPED_TRACE(type);
+        auto params = makeStageParams(0, type);
+        PPExecutor executor(params, nullptr, false);
+        auto* wire = attachTransport(executor);
+        auto* recorded = installModel<RecordingDraftModel>(executor);
+        auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 2);
+        stream->setPPInflight();
+
+        ASSERT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
+
+        const auto plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
+        if (type != SP_TYPE_NONE) {
+            EXPECT_EQ(stream->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+            EXPECT_NE(stream->statusInfo().ToString().find(
+                          type == SP_TYPE_DSPARK ? "tiled sampling" : "incompatible with logits processor"),
+                      std::string::npos);
+            EXPECT_FALSE(stream->isPPInflight());
+            EXPECT_FALSE(stream->getSPOutputBuffer());
+            EXPECT_TRUE(plan.model_input.skip_run);
+            EXPECT_TRUE(recorded->inputs.empty());
+        } else {
+            EXPECT_FALSE(stream->hasError());
+            EXPECT_TRUE(stream->isPPInflight());
+            EXPECT_EQ(recorded->inputs.size(), 1u);
+            EXPECT_FALSE(plan.model_input.skip_run);
+            EXPECT_EQ(plan.sampling_plan.num_return_sequences, std::vector<int32_t>{2});
+        }
+    }
+}
+
+TEST_F(PPExecutorTest, FirstDecodeRequiresValidProposalStateBeforeSendingAPlan) {
+    for (auto type : {SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
+        for (bool missing : {false, true}) {
+            SCOPED_TRACE(testing::Message() << "type=" << type << ", missing=" << missing);
+            auto params = makeStageParams(0, type);
+            PPExecutor executor(params, nullptr, false);
+            auto* wire = attachTransport(executor);
+            auto* recorded = installModel<RecordingDraftModel>(executor);
+            auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
+            stream->setIsContextStream(false);
+            if (!missing) {
+                auto buffer = std::make_shared<SpeculativeExecutorStreamOutput>();
+                /** K=3 requires an anchor plus three draft tokens; this buffer is one token short. */
+                buffer->tokens = intTensor({7, 11, 12});
+                stream->setSPOutputBuffer(buffer);
+            }
+            try {
+                (void)executor.process(ScheduleOutput{{stream}});
+                FAIL() << "decode accepted invalid proposal state";
+            } catch (const std::runtime_error& error) {
+                EXPECT_NE(std::string(error.what()).find(
+                              missing ? "requires proposal tokens" : "token buffer must contain"),
+                          std::string::npos)
+                    << error.what();
+            }
+            EXPECT_FALSE(stream->hasError());
+            EXPECT_TRUE(recorded->inputs.empty());
+            EXPECT_TRUE(wire->sent_tensors.empty());
+        }
     }
 }
 
@@ -1731,7 +1927,7 @@ TEST_F(PPExecutorTest, FirstSpAdmissionFiltersUnsupportedRequestsBeforeForward) 
     }
 }
 
-TEST_F(PPExecutorTest, FirstPrefillOnlySkipsSpeculativeAdmissionAndDrainsItsResult) {
+TEST_F(PPExecutorTest, FirstPrefillOnlySkipsSamplingCompatibilityAndDrainsItsResult) {
     for (auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
         SCOPED_TRACE(type);
         auto params = makeStageParams(0, type);
