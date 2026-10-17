@@ -335,6 +335,7 @@ class Qwen3NextPPAuxCaptureTest(unittest.TestCase):
                     model = self._make_stage(counts, rank, capture_ids)
                     output = self._forward(model, token_ids, intermediates)
                     if rank != len(counts) - 1:
+                        self.assertIsNone(model.get_mtp_target_hidden_states(-1))
                         intermediates = output.pp_intermediates
                         reached = sum(layer < sum(counts[: rank + 1]) for layer in capture_ids)
                         if reached:
@@ -356,14 +357,43 @@ class Qwen3NextPPAuxCaptureTest(unittest.TestCase):
                         model.get_mtp_target_hidden_states(-1), expected.mtp_target_hidden_states
                     )
 
-    def test_later_forward_does_not_overwrite_inflight_prefix(self):
-        model = self._make_stage([2, 2], 0, (1, 3))
-        first = self._forward(model, torch.tensor([1, 2], dtype=torch.int32))
-        prefix = first.pp_intermediates["mtp_aux_hidden_states"]
-        saved = prefix.clone()
-        second = self._forward(model, torch.tensor([10, 20], dtype=torch.int32))
-        self.assertNotEqual(prefix.data_ptr(), second.pp_intermediates["mtp_aux_hidden_states"].data_ptr())
-        torch.testing.assert_close(prefix, saved)
+    def test_capture_reuses_capacity_and_exposes_only_current_rows(self):
+        counts = [2, 2]
+        capture_ids = (1, 3)
+        stages = [self._make_stage(counts, rank, capture_ids) for rank in range(2)]
+        whole = self._make_stage([sum(counts)], 0, capture_ids)
+        for verify in (False, True):
+            capacity = 0
+            pointers = [None, None]
+            for step, rows in enumerate((3, 1, 5, 2)):
+                with self.subTest(verify=verify, rows=rows):
+                    token_ids = torch.arange(rows, dtype=torch.int32) + step * 10
+                    expected = self._forward(whole, token_ids, verify=verify)
+                    intermediates = None
+                    for rank, model in enumerate(stages):
+                        output = self._forward(
+                            model, token_ids, intermediates, verify=verify
+                        )
+                        if rank == 0:
+                            intermediates = output.pp_intermediates
+                            features = intermediates["mtp_aux_hidden_states"]
+                            self.assertIsNone(model.get_mtp_target_hidden_states(-1))
+                        else:
+                            self.assertFalse(output.pp_intermediates)
+                            features = output.mtp_target_hidden_states
+                        width = (rank + 1) * 4
+                        self.assertEqual(tuple(features.shape), (rows, width))
+                        self.assertTrue(features.is_contiguous())
+                        torch.testing.assert_close(
+                            features, expected.mtp_target_hidden_states[:, :width]
+                        )
+                        if rows <= capacity:
+                            self.assertEqual(features.data_ptr(), pointers[rank])
+                        pointers[rank] = features.data_ptr()
+                    torch.testing.assert_close(
+                        output.hidden_states, expected.hidden_states
+                    )
+                    capacity = max(capacity, rows)
 
     def test_warmup_includes_only_preceding_capture_layers(self):
         for rank, parts in ((0, 0), (1, 1), (2, 2), (3, 2)):
@@ -374,16 +404,6 @@ class Qwen3NextPPAuxCaptureTest(unittest.TestCase):
             else:
                 self.assertNotIn("mtp_aux_hidden_states", inputs)
             self.assertEqual(tuple(inputs["residual"].shape), (5, 4))
-
-    def test_missing_or_misaligned_prefix_is_rejected(self):
-        model = self._make_stage([2, 2], 1, (1, 3))
-        for prefix in (None, torch.zeros(3, 4), torch.zeros(2, 8)):
-            with self.subTest(shape=None if prefix is None else tuple(prefix.shape)):
-                intermediates = {"hidden_states": torch.zeros(2, 4), "residual": torch.ones(2, 4)}
-                if prefix is not None:
-                    intermediates["mtp_aux_hidden_states"] = prefix
-                with self.assertRaisesRegex(RuntimeError, "PP auxiliary hidden prefix"):
-                    self._forward(model, torch.tensor([1, 2], dtype=torch.int32), intermediates)
 
 
 class Qwen3PPBoundaryTest(unittest.TestCase):

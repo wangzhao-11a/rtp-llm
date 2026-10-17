@@ -449,7 +449,7 @@ TEST_F(MtpComputeTest, SharedDraftContinuationUsesValidLengthsForBothLayouts) {
     }
 }
 
-TEST_F(MtpComputeTest, SharedAdvancePreservesHiddenStatesAcrossBufferReuse) {
+TEST_F(MtpComputeTest, SharedAdvanceReusesHiddenStates) {
     for (bool device_input : {false, true}) {
         const auto device = device_input ? torch::kCUDA : torch::kCPU;
         GptModelInputs input;
@@ -463,13 +463,13 @@ TEST_F(MtpComputeTest, SharedAdvancePreservesHiddenStatesAcrossBufferReuse) {
         TensorHolder holder;
 
         mtp::advanceDraftInput(input, hidden_buffer, draft_tokens, 1, holder);
-        hidden_buffer.fill_(9);
 
         EXPECT_EQ(toVec<int32_t>(input.combo_tokens), (std::vector<int32_t>{3, 4}));
         EXPECT_EQ(toVec<int32_t>(input.sequence_lengths), (std::vector<int32_t>{9, 11}));
         EXPECT_EQ(toVec<int32_t>(input.combo_position_ids), (std::vector<int32_t>{8, 10}));
         EXPECT_TRUE(input.sequence_lengths.is_cuda());
         EXPECT_TRUE(input.combo_position_ids.is_pinned());
+        EXPECT_EQ(input.last_hidden_states.data_ptr(), hidden_buffer.data_ptr());
         EXPECT_TRUE(torch::equal(input.last_hidden_states, torch::ones_like(hidden_buffer)));
         EXPECT_EQ(toVec<int32_t>(original_lengths), (std::vector<int32_t>{8, 10}));
         EXPECT_EQ(toVec<int32_t>(original_positions), (std::vector<int32_t>{7, 9}));

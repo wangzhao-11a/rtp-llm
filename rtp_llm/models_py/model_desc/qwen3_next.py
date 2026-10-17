@@ -1611,10 +1611,7 @@ class Qwen3NextModel(GptModelBase):
             "hidden_states": hidden_template,
             "residual": torch.zeros_like(hidden_template),
         }
-        previous_parts = sum(
-            layer_id < self.pp_layer_ids_list[0]
-            for layer_id in self._mtp_aux_capture_layer_ids
-        )
+        previous_parts, _ = self._aux_hidden_capture_parts()
         if previous_parts:
             tensors["mtp_aux_hidden_states"] = hidden_template.new_zeros(
                 (hidden_template.shape[0], previous_parts * hidden_template.shape[1])
@@ -1821,14 +1818,12 @@ class Qwen3NextModel(GptModelBase):
             fmha_impl = self.prepare_fmha_impl(inputs)
 
         capture_aux_hidden = bool(self._mtp_aux_capture_layer_ids)
-        pp_capture = self._apply_pp_partition and self.pp_size > 1
         if capture_aux_hidden:
-            if pp_capture:
-                self.begin_pp_aux_hidden_capture(
-                    hidden_states, inputs.pp_intermediates.get("mtp_aux_hidden_states")
-                )
-            else:
-                self.begin_aux_hidden_capture(hidden_states, is_target_verify)
+            self.begin_aux_hidden_capture(
+                hidden_states,
+                is_target_verify,
+                upstream_hidden=inputs.pp_intermediates.get("mtp_aux_hidden_states"),
+            )
 
         for local_idx, decoder_layer in enumerate(self.layers):
             layer_attention_inputs = select_attention_inputs_for_layer(
@@ -1854,10 +1849,7 @@ class Qwen3NextModel(GptModelBase):
                 self.capture_aux_hidden(global_layer_id, hidden_states, residual)
             capture.capture_layer(global_layer_id, hidden_states, residual)
         if capture_aux_hidden:
-            if pp_capture:
-                self.finish_pp_aux_hidden_capture()
-            else:
-                self.finish_aux_hidden_capture()
+            self.finish_aux_hidden_capture()
 
         if self.norm is not None:
             hidden_states, residual = self.norm(hidden_states, residual)

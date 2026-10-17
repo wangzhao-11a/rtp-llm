@@ -77,6 +77,7 @@ class GptModelBase(nn.Module):
         self._mtp_aux_capture_buffer: Optional[torch.Tensor] = None
         self._mtp_aux_capture_rows = 0
         self._mtp_aux_capture_index = 0
+        self._mtp_aux_capture_expected_parts = 0
 
         self._capture_context = CaptureContext.unsupported()
 
@@ -210,25 +211,44 @@ class GptModelBase(nn.Module):
         """Model hook: None means every attention-input tag requires FMHA."""
         return None
 
-    def begin_aux_hidden_capture(
-        self, hidden_states: torch.Tensor, is_target_verify: bool
-    ) -> None:
-        """Start one target auxiliary-hidden capture.
+    def _aux_hidden_capture_parts(self) -> tuple[int, int]:
+        """Count configured boundaries before and through this model's layers."""
+        if not self._mtp_aux_capture_layer_ids:
+            return 0, 0
+        layer_ids = self.pp_layer_ids()
+        previous_parts = sum(
+            layer_id < layer_ids[0] for layer_id in self._mtp_aux_capture_layer_ids
+        )
+        expected_parts = sum(
+            layer_id <= layer_ids[-1] for layer_id in self._mtp_aux_capture_layer_ids
+        )
+        return previous_parts, expected_parts
 
-        Decode graphs keep one grow-only buffer so every captured batch bucket
-        writes to a stable address. Prompt prefill owns a separate grow-only
-        buffer because its token count can exceed the decode graph capacity.
+    def begin_aux_hidden_capture(
+        self,
+        hidden_states: torch.Tensor,
+        is_target_verify: bool,
+        upstream_hidden: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Capture this model's configured layers after any upstream prefix.
+
+        Prompt and verify use separate grow-only buffers so prompt growth does
+        not change the addresses used by decode graphs. The executor snapshots
+        PP outputs before another forward can reuse these buffers.
         """
         self._mtp_target_hidden_states = None
         self._mtp_aux_capture_buffer = None
         self._mtp_aux_capture_rows = int(hidden_states.shape[0])
-        self._mtp_aux_capture_index = 0
+        previous_parts, expected_parts = self._aux_hidden_capture_parts()
+        # Local captures append after the slots supplied by upstream stages.
+        self._mtp_aux_capture_index = previous_parts
+        self._mtp_aux_capture_expected_parts = expected_parts
 
-        layer_ids = self._mtp_aux_capture_layer_ids
-        if not layer_ids:
+        if expected_parts == 0:
             return
 
-        width = len(layer_ids) * int(hidden_states.shape[-1])
+        hidden_width = int(hidden_states.shape[-1])
+        width = expected_parts * hidden_width
         buffer = (
             self._mtp_target_graph_buffer
             if is_target_verify
@@ -250,64 +270,10 @@ class GptModelBase(nn.Module):
                 self._mtp_target_graph_buffer = buffer
             else:
                 self._mtp_target_prompt_buffer = buffer
-        self._mtp_aux_capture_buffer = buffer
-
-    def begin_pp_aux_hidden_capture(
-        self,
-        hidden_states: torch.Tensor,
-        upstream_hidden: Optional[torch.Tensor],
-    ) -> None:
-        """Resume the ordered capture prefix produced by earlier PP stages.
-
-        Only layer boundaries reached by this stage occupy the output buffer.
-        Each forward owns fresh contiguous storage: PP sends can outlive this
-        forward, so reusing the single-stage capture buffer would overwrite
-        features belonging to an in-flight batch. Rows retain the target's
-        current token layout, including CP-local padding.
-        """
-        layer_ids = self.pp_layer_ids()
-        previous_parts = sum(
-            layer_id < layer_ids[0] for layer_id in self._mtp_aux_capture_layer_ids
-        )
-        self._mtp_aux_capture_expected_parts = sum(
-            layer_id <= layer_ids[-1] for layer_id in self._mtp_aux_capture_layer_ids
-        )
-        self._mtp_target_hidden_states = None
-        self._mtp_aux_capture_rows = int(hidden_states.shape[0])
-        self._mtp_aux_capture_index = previous_parts
-        self._mtp_aux_capture_buffer = None
-        hidden_width = int(hidden_states.shape[-1])
-        prefix_shape = (self._mtp_aux_capture_rows, previous_parts * hidden_width)
-        if previous_parts and (
-            upstream_hidden is None or tuple(upstream_hidden.shape) != prefix_shape
-        ):
-            actual_shape = (
-                None if upstream_hidden is None else tuple(upstream_hidden.shape)
-            )
-            raise RuntimeError(
-                f"PP auxiliary hidden prefix has shape {actual_shape}, expected {prefix_shape}"
-            )
-        if self._mtp_aux_capture_expected_parts == 0:
-            return
-        self._mtp_aux_capture_buffer = hidden_states.new_empty(
-            (
-                self._mtp_aux_capture_rows,
-                self._mtp_aux_capture_expected_parts * hidden_width,
-            )
-        )
+        self._mtp_aux_capture_buffer = buffer[: self._mtp_aux_capture_rows]
         if previous_parts:
-            self._mtp_aux_capture_buffer[:, : prefix_shape[1]].copy_(upstream_hidden)
-
-    def finish_pp_aux_hidden_capture(self) -> None:
-        """Forward the completed prefix; only the tail publishes draft inputs."""
-        if self._mtp_aux_capture_index != self._mtp_aux_capture_expected_parts:
-            raise RuntimeError(
-                "PP auxiliary hidden capture missed configured layers: "
-                f"captured={self._mtp_aux_capture_index}, "
-                f"expected={self._mtp_aux_capture_expected_parts}"
-            )
-        if self.pp_has_lm_head:
-            self.finish_aux_hidden_capture()
+            prefix_width = previous_parts * hidden_width
+            self._mtp_aux_capture_buffer[:, :prefix_width].copy_(upstream_hidden)
 
     def capture_aux_hidden(
         self,
@@ -336,7 +302,8 @@ class GptModelBase(nn.Module):
         self._mtp_aux_capture_index += 1
 
     def finish_aux_hidden_capture(self) -> None:
-        expected_parts = len(self._mtp_aux_capture_layer_ids)
+        """Validate this stage's prefix; only a complete target publishes it."""
+        expected_parts = self._mtp_aux_capture_expected_parts
         if expected_parts == 0:
             return
         if self._mtp_aux_capture_index != expected_parts:
@@ -346,9 +313,8 @@ class GptModelBase(nn.Module):
             )
         if self._mtp_aux_capture_buffer is None:
             raise RuntimeError("auxiliary hidden capture buffer is unavailable")
-        self._mtp_target_hidden_states = self._mtp_aux_capture_buffer[
-            : self._mtp_aux_capture_rows
-        ]
+        if not self._apply_pp_partition or self.pp_has_lm_head:
+            self._mtp_target_hidden_states = self._mtp_aux_capture_buffer
 
     def get_mtp_target_hidden_states(
         self, num_tokens: int

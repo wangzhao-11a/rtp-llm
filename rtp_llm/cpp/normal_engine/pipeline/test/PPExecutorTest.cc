@@ -104,6 +104,7 @@ public:
         if (on_forward) {
             on_forward();
         }
+        /** Draft inputs may alias the previous output; consume them before reusing hidden_buffer. */
         inputs.push_back(snapshotInput(input));
         const auto step    = static_cast<int64_t>(inputs.size() - 1);
         const auto rows    = input.combo_tokens.numel();
@@ -112,9 +113,6 @@ public:
             hidden_buffer = torch::empty({rows, 4}, options);
         }
         hidden_buffer.narrow(0, 0, rows).copy_(torch::arange(rows * 4, options).reshape({rows, 4}) + step * 100);
-        if (input.last_hidden_states.defined()) {
-            EXPECT_TRUE(torch::equal(input.last_hidden_states, inputs.back().last_hidden_states));
-        }
         GptModelOutputs output;
         output.all_hidden_states = hidden_buffer.narrow(0, 0, rows).narrow(1, 0, 2);
         if (input.skip_lm_head) {

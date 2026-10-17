@@ -592,7 +592,7 @@ void advanceDraftInput(GptModelInputs&      draft_input,
                        size_t               position_id_len_factor,
                        TensorHolder&        host_holder) {
     int batch_size                 = draft_input.combo_tokens.size(0);
-    draft_input.last_hidden_states = draft_hidden_states.clone();
+    draft_input.last_hidden_states = draft_hidden_states;
     draft_input.combo_tokens       = draft_token_ids.reshape({batch_size});
 
     if (draft_input.combo_position_ids.defined()) {
