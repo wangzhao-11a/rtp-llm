@@ -3515,7 +3515,7 @@ TEST_F(PPExecutorTest, PrefillHandoffUsesExplicitDraftOutputWithoutMtpBuffer) {
     auto draft = std::make_unique<RecordingDraftModel>();
     draft->expose_mtp_hidden = false;
     executor.draft_model_ = std::move(draft);
-    const auto plan = makePlan(params);
+    auto plan = makePlan(params);
     PPExecutionResult result;
     result.new_token_ids = intTensor({7, 8}).reshape({2, 1});
     result.new_token_lengths = torch::ones({2}, torch::kInt32);
@@ -3883,7 +3883,7 @@ TEST_F(PPExecutorTest, LastVerifyIgnoresSamplerFailuresAfterTheRejectedPrefix) {
     EXPECT_TRUE(result.propose_token_ids.defined());
 }
 
-TEST_F(PPExecutorTest, LastDraftForwardUsesDraftCacheStridesWithoutMutatingTargetInput) {
+TEST_F(PPExecutorTest, LastDraftForwardUsesDraftCacheStrides) {
     for (bool multiple_groups : {false, true}) {
         SCOPED_TRACE(multiple_groups);
         auto params = makeStageParams(2, SP_TYPE_MTP, 1);
@@ -3930,7 +3930,7 @@ TEST_F(PPExecutorTest, LastDraftForwardUsesDraftCacheStridesWithoutMutatingTarge
     }
 }
 
-TEST_F(PPExecutorTest, LastDraftChainUsesEachForwardHiddenAndPreservesTargetInput) {
+TEST_F(PPExecutorTest, LastDraftChainUsesTargetAndPreviousDraftHidden) {
     for (bool expose_mtp_hidden : {false, true}) {
         SCOPED_TRACE(expose_mtp_hidden);
         auto       params = makeStageParams(2, SP_TYPE_MTP);
@@ -3955,13 +3955,15 @@ TEST_F(PPExecutorTest, LastDraftChainUsesEachForwardHiddenAndPreservesTargetInpu
         target_input.request_id            = torch::tensor({101, 202}, torch::kInt64);
         target_input.request_pd_separation = torch::ones({2}, torch::kBool);
         target_input.cache_keys            = torch::ones({2, 3}, torch::kInt64);
+        target_input.combo_position_ids    = intTensor({3, 4, 5, 6, 7});
+        executor.position_id_len_factor_   = 1;
 
         PPSamplingPlan   sampling_plan;
         PPExecutionResult execution_result;
         execution_result.new_token_ids     = intTensor({2, 5}).reshape({2, 1});
         execution_result.new_token_lengths = intTensor({1, 1});
         executor.runDraftStep(target_input,
-                              torch::Tensor(),
+                              intTensor({5, 8}),
                               target_hidden,
                               false,
                               sampling_plan,
@@ -3973,9 +3975,16 @@ TEST_F(PPExecutorTest, LastDraftChainUsesEachForwardHiddenAndPreservesTargetInpu
         EXPECT_EQ(proposed.scalar_type(), torch::kInt32);
         EXPECT_TRUE(torch::equal(proposed, intTensor({10, 12, 14, 11, 13, 15}).reshape({2, 3})));
         EXPECT_TRUE(torch::equal(recorded->inputs.front().last_hidden_states, target_hidden));
+        EXPECT_EQ(tensorToVector<int32_t>(recorded->inputs.front().combo_tokens),
+                  (std::vector<int32_t>{1, 2, 3, 4, 5}));
+        EXPECT_EQ(tensorToVector<int32_t>(recorded->inputs.front().combo_position_ids),
+                  (std::vector<int32_t>{4, 5, 6, 7, 8}));
         for (int64_t step = 1; step < 3; ++step) {
             const auto& input = recorded->inputs[step];
             EXPECT_TRUE(torch::equal(input.combo_tokens.cpu(), proposed.select(1, step - 1)));
+            EXPECT_TRUE(torch::equal(input.input_lengths.cpu(), intTensor({1, 1})));
+            EXPECT_EQ(tensorToVector<int32_t>(input.combo_position_ids),
+                      (std::vector<int32_t>{5 + static_cast<int32_t>(step), 8 + static_cast<int32_t>(step)}));
             EXPECT_FALSE(input.request_id.defined());
             EXPECT_FALSE(input.request_pd_separation.defined());
             EXPECT_FALSE(input.cache_keys.defined());
@@ -3983,9 +3992,6 @@ TEST_F(PPExecutorTest, LastDraftChainUsesEachForwardHiddenAndPreservesTargetInpu
                                                torch::arange(8, torch::kFloat32).reshape({2, 4}) + 100;
             EXPECT_TRUE(torch::equal(input.last_hidden_states.cpu(), expected_hidden.narrow(1, 0, hidden_width)));
         }
-        EXPECT_EQ(tensorToVector<int32_t>(target_input.combo_tokens), (std::vector<int32_t>{0, 1, 0, 3, 4}));
-        EXPECT_EQ(tensorToVector<int32_t>(target_input.input_lengths), (std::vector<int32_t>{2, 3}));
-        EXPECT_EQ(tensorToVector<int32_t>(target_input.prefix_lengths), (std::vector<int32_t>{3, 5}));
         EXPECT_TRUE(torch::equal(target_hidden.cpu(),
                                  torch::arange(20, torch::kFloat32).reshape({5, 4}).narrow(1, 0, hidden_width)));
     }

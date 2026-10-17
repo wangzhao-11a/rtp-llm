@@ -155,7 +155,7 @@ private:
 
     GptModelOutputs forwardDraftModel(ModelBase& draft_model, GptModelInputs& draft_input);
 
-    void runDraftStep(const GptModelInputs& target_input,
+    void runDraftStep(GptModelInputs&       target_input,
                       const torch::Tensor&  draft_next_position_ids,
                       const torch::Tensor&  target_hidden_states,
                       bool                  is_decode,

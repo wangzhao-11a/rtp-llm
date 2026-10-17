@@ -996,7 +996,7 @@ void PPExecutor::fillFailedDraftRows(PPExecutionResult& result) {
     }
 }
 
-void PPExecutor::runDraftStep(const GptModelInputs& target_input,
+void PPExecutor::runDraftStep(GptModelInputs&       target_input,
                               const torch::Tensor&  draft_next_position_ids,
                               const torch::Tensor&  target_hidden_states,
                               bool                  is_decode,

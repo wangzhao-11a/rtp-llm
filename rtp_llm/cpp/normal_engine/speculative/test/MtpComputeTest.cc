@@ -177,19 +177,23 @@ TEST_F(MtpComputeTest, SharedHiddenOverridePreservesViewsAndFallbacks) {
     }
 }
 
-TEST_F(MtpComputeTest, SharedPrefillInputPreservesTargetTensors) {
-    for (bool device_input : {false, true}) {
-        const auto device = device_input ? torch::kCUDA : torch::kCPU;
-        GptModelInputs target_input;
-        target_input.is_target_verify = true;
-        target_input.combo_tokens = torch::tensor({11, 21, 22}, torch::kInt32).to(device);
-        target_input.input_lengths = torch::tensor({1, 2}, torch::kInt32).to(device);
-        target_input.combo_position_ids =
-            torch::tensor({5, 6, 7, 10, 11, 12, 11, 12, 13}, torch::kInt32).to(device);
-        auto sampled_tokens = torch::tensor({{-1, 12}, {-1, 23}}, torch::kInt32).to(device);
-        auto next_positions = torch::tensor({6, 7, 8, 12, 13, 14}, torch::kInt32).to(device);
-        auto hidden_states = torch::arange(6, torch::kFloat32).reshape({3, 2}).cuda();
-        auto draft_input = target_input;
+TEST_F(MtpComputeTest, PrefillShiftsTokensAndPositions) {
+    const auto host_options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    for (const auto& options : {host_options, host_options.pinned_memory(true), host_options.device(torch::kCUDA)}) {
+        const auto device           = options.device();
+        const bool device_input     = device.is_cuda();
+        const auto position_options = host_options.pinned_memory(device_input || options.pinned_memory());
+        SCOPED_TRACE(::testing::Message() << "device=" << device << " pinned=" << options.pinned_memory());
+        GptModelInputs draft_input;
+        draft_input.combo_tokens       = torch::tensor({11, 21, 22}, options);
+        draft_input.input_lengths      = torch::tensor({1, 2}, options);
+        draft_input.combo_position_ids = torch::tensor({5, 6, 7, 10, 11, 12, 11, 12, 13}, position_options);
+        const auto tokens_alias    = draft_input.combo_tokens;
+        const auto lengths_alias   = draft_input.input_lengths;
+        const auto positions_alias = draft_input.combo_position_ids;
+        auto sampled_tokens        = torch::tensor({{-1, 12}, {-1, 23}}, torch::kInt32).to(device);
+        auto next_positions        = torch::tensor({6, 7, 8, 12, 13, 14}, position_options);
+        auto hidden_states         = torch::arange(6, torch::kFloat32).reshape({3, 2}).cuda();
         TensorHolder holder;
 
         mtp::prepareDraftPrefillAfterTargetPrefill(draft_input, hidden_states, sampled_tokens, next_positions, 3, holder);
@@ -199,17 +203,32 @@ TEST_F(MtpComputeTest, SharedPrefillInputPreservesTargetTensors) {
         EXPECT_EQ(toVec<int32_t>(draft_input.combo_position_ids),
                   (std::vector<int32_t>{6, 7, 8, 11, 12, 13, 12, 13, 14}));
         EXPECT_TRUE(draft_input.combo_tokens.is_cuda());
-        EXPECT_TRUE(draft_input.combo_position_ids.is_pinned());
-        EXPECT_TRUE(torch::equal(draft_input.last_hidden_states, hidden_states));
-        EXPECT_FALSE(draft_input.is_target_verify);
-        EXPECT_TRUE(target_input.is_target_verify);
-        EXPECT_EQ(toVec<int32_t>(target_input.combo_tokens), (std::vector<int32_t>{11, 21, 22}));
-        EXPECT_EQ(toVec<int32_t>(target_input.combo_position_ids),
-                  (std::vector<int32_t>{5, 6, 7, 10, 11, 12, 11, 12, 13}));
+        EXPECT_TRUE(draft_input.input_lengths.is_cuda());
+        EXPECT_TRUE(draft_input.combo_position_ids.device().is_cpu());
+        EXPECT_EQ(draft_input.combo_position_ids.data_ptr(), positions_alias.data_ptr());
+        EXPECT_EQ(draft_input.combo_position_ids.is_pinned(), position_options.pinned_memory());
+        EXPECT_EQ(draft_input.last_hidden_states.data_ptr(), hidden_states.data_ptr());
+        if (device_input) {
+            EXPECT_EQ(toVec<int32_t>(tokens_alias), (std::vector<int32_t>{11, 21, 22}));
+            EXPECT_NE(draft_input.combo_tokens.data_ptr(), tokens_alias.data_ptr());
+            EXPECT_NE(draft_input.input_lengths.data_ptr(), lengths_alias.data_ptr());
+            const auto holds_pinned_source = [&](const std::vector<int32_t>& values) {
+                for (const auto& source : holder.tensors) {
+                    if (source.device().is_cpu() && source.is_pinned() && toVec<int32_t>(source) == values) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            EXPECT_TRUE(holds_pinned_source({1, 2}));
+            EXPECT_TRUE(holds_pinned_source({12, 22, 23}));
+        } else {
+            EXPECT_EQ(toVec<int32_t>(tokens_alias), (std::vector<int32_t>{12, 22, 23}));
+        }
     }
 }
 
-TEST_F(MtpComputeTest, SharedPrefillShiftsMultimodalFieldsWithoutChangingTarget) {
+TEST_F(MtpComputeTest, PrefillAlignsMultimodalFieldsWithShiftedTokens) {
     for (bool device_input : {false, true}) {
         for (bool starts_at_boundary : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "device_input=" << device_input
@@ -260,7 +279,6 @@ TEST_F(MtpComputeTest, SharedPrefillShiftsMultimodalFieldsWithoutChangingTarget)
                 EXPECT_TRUE(torch::equal(target_input.mm_extra_input->at(i).cpu(),
                                          torch::arange(rows * 8, torch::kFloat32) + offset));
             }
-            EXPECT_EQ(toVec<int32_t>(target_input.combo_tokens), (std::vector<int32_t>{10, 11, 12, 20, 21}));
             EXPECT_EQ(toVec<int32_t>(target_input.text_tokens_mask), masks);
             EXPECT_EQ(toVec<int32_t>(target_input.combo_tokens_type_ids), types);
             EXPECT_EQ(toVec<int32_t>(target_input.mm_features_locs), locs);
@@ -268,7 +286,7 @@ TEST_F(MtpComputeTest, SharedPrefillShiftsMultimodalFieldsWithoutChangingTarget)
     }
 }
 
-TEST_F(MtpComputeTest, SharedPrefillDropsFeaturesRemovedAtRequestStart) {
+TEST_F(MtpComputeTest, PrefillDropsFeaturesRemovedAtRequestStart) {
     for (bool device_input : {false, true}) {
         SCOPED_TRACE(device_input);
         const auto device = device_input ? torch::kCUDA : torch::kCPU;
