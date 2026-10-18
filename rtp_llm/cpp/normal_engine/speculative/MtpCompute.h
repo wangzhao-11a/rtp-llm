@@ -77,18 +77,22 @@ void prepareDraftPrefillAfterTargetPrefill(GptModelInputs&      draft_input,
                                           size_t               position_id_len_factor,
                                           TensorHolder&        host_holder);
 
-/** Use valid prefixes of [B, K+1] tokens and matching verify hidden rows.
- * Lengths include retained correction/bonus; callers handle caps, errors and transfer readiness. */
+/** Prepare draft KV prefill for tokens accepted by target verification.
+ * accepted_token_ids: [batch_size, propose_step + 1]; lengths include any retained correction/bonus token.
+ * The caller ensures input readiness and retains hidden_states_d_t for the draft round. */
 void prepareDraftPrefillAfterVerify(GptModelInputs&      draft_input,
                                     const torch::Tensor& target_hidden_states,
                                     const torch::Tensor& accepted_token_ids,
                                     const torch::Tensor& accepted_lengths,
+                                    size_t               batch_size,
+                                    int64_t              propose_step,
                                     DraftInputLayout     layout,
                                     size_t               position_id_len_factor,
+                                    torch::Tensor&       hidden_states_d_t,
                                     TensorHolder&        host_holder);
 
-/** Single-rank TP skips synchronization. COMPACT syncs shapes and data.
- * FIXED_WIDTH requires matching CUDA buffers on all ranks (lm_output_indexes: [B]) and consistent remaining inputs. */
+/** Synchronize post-verification draft inputs across TP ranks.
+ * FIXED_WIDTH requires matching CUDA token/hidden/index buffers; other input fields must already agree. */
 void syncDraftPrefillAfterVerify(GptModelInputs&          draft_input,
                                  DraftInputLayout         layout,
                                  const ParallelismConfig& parallelism_config);

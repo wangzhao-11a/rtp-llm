@@ -7,6 +7,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <pybind11/embed.h>
+#include <torch/extension.h>
 #include "torch/all.h"
 #include "gtest/gtest.h"
 
@@ -37,6 +39,8 @@
 #endif
 
 namespace rtp_llm {
+
+void registerExecCtxOps(pybind11::module& m);
 
 using namespace std;
 namespace spec = speculative;
@@ -147,6 +151,7 @@ struct MtpExecutorTestConfig {
     size_t  vocab_size_override    = 0;  // 0 means use vocab_size
     int64_t mm_position_ids_style  = 0;
     int     position_id_len_factor = 1;
+    int     tp_size                = 1;
 
     SpeculativeType sp_type              = SP_TYPE_MTP;
     int64_t         dspark_mask_token_id = -1;
@@ -762,6 +767,8 @@ public:
         params.sp_config               = sp_config;
         params.pd_sep_config.role_type = test_config.role_type;
         params.parallelism_config.role_type = test_config.role_type;
+        params.parallelism_config.tp_size   = test_config.tp_size;
+        params.parallelism_config.world_size = test_config.tp_size;
         if (test_config.vocab_size_override > 0) {
             params.model_config_.vocab_size = test_config.vocab_size_override;
         }
@@ -1745,8 +1752,82 @@ TEST_F(MtpExecutorTest, testDSparkPrefillCommitDoesNotUseTargetVerifyContract) {
     EXPECT_TRUE(stream->getProposeToken().empty());
 }
 
-TEST_F(MtpExecutorTest, testDSparkPublicationFailurePreventsPrefillDispatch) {
+namespace {
+
+enum class PublicationOutcome { Success, Error, Exception };
+
+struct PublicationCase {
+    const char*        name;
+    int                tp_size;
+    PublicationOutcome target;
+    PublicationOutcome draft;
+    bool               peer_ok;
+};
+
+/** Exercise the real TP publication reduction while scripting the collective's peer result. */
+class PublicationCollectives {
+public:
+    explicit PublicationCollectives(std::function<bool(bool)> reduce) {
+        ops_ = py::module_::import("types").attr("ModuleType")("mtp_publication_test").cast<py::module_>();
+        registerExecCtxOps(ops_);
+        ops_.attr("register_comm_ops")(
+            py::cpp_function([](const std::vector<torch::Tensor>&, int64_t root, int mode) {
+                EXPECT_EQ(root, 0);
+                EXPECT_EQ(mode, static_cast<int>(ParallelMode::TP));
+            }),
+            py::cpp_function([reduce](torch::Tensor status, int op, int mode, py::object dest) {
+                EXPECT_EQ(op, static_cast<int>(ReduceOp::Min));
+                EXPECT_EQ(mode, static_cast<int>(ParallelMode::TP));
+                EXPECT_TRUE(dest.is_none());
+                return torch::full_like(status, reduce(status.item<int32_t>() != 0));
+            }),
+            py::cpp_function([](py::args) { ADD_FAILURE() << "unexpected allgather"; }));
+    }
+
+    ~PublicationCollectives() {
+        ops_.attr("clear_comm_ops")();
+    }
+
+private:
+    py::module_ ops_;
+};
+
+}
+
+class MtpExecutorPublicationTest: public MtpExecutorTest, public ::testing::WithParamInterface<PublicationCase> {
+public:
+    static void SetUpTestSuite() {
+        interpreter_ = std::make_unique<py::scoped_interpreter>();
+        /** Resolve Python OpenSSL modules before the executable's linked BoringSSL symbols. */
+        py::exec(R"(
+import os
+import sys
+flags = sys.getdlopenflags()
+try:
+    sys.setdlopenflags(flags | os.RTLD_DEEPBIND)
+    import hashlib
+    import ssl
+finally:
+    sys.setdlopenflags(flags)
+)");
+        py::module_::import("torch");
+    }
+
+    static void TearDownTestSuite() {
+        interpreter_.reset();
+    }
+
+private:
+    inline static std::unique_ptr<py::scoped_interpreter> interpreter_;
+};
+
+TEST_P(MtpExecutorPublicationTest, DispatchesOnlyAfterAllRanksPublishBothModels) {
+    const auto& publication = GetParam();
+    const bool local_ok = publication.target == PublicationOutcome::Success
+                          && publication.draft == PublicationOutcome::Success;
+    const bool success = local_ok && publication.peer_ok;
     MtpExecutorTestConfig test_config;
+    test_config.tp_size              = publication.tp_size;
     test_config.gen_num_per_cycle    = 3;
     test_config.vocab_size_override  = test_config.vocab_size;
     test_config.sp_type              = SP_TYPE_DSPARK;
@@ -1769,12 +1850,36 @@ TEST_F(MtpExecutorTest, testDSparkPublicationFailurePreventsPrefillDispatch) {
         torch::tensor({0.01f, 0.02f, 0.03f, 0.04f, 0.05f, 0.06f, 0.07f, 0.08f}).reshape({4, 2});
     components.fake_target_model->setInputs({target_input});
     components.fake_target_model->setOutputs({target_output});
-    components.fake_target_model->setPublicationException(
-        std::make_exception_ptr(std::runtime_error("target store wait failed")));
 
-    bool draft_waited = false;
-    components.fake_draft_prefill_model->setPublicationObserver([&draft_waited]() { draft_waited = true; });
-    components.fake_draft_prefill_model->setPublicationResult("draft store failed");
+    int target_waits = 0;
+    int draft_waits  = 0;
+    int reductions   = 0;
+    auto assert_not_dispatched = [&] {
+        EXPECT_FALSE(stream->hasError());
+        EXPECT_TRUE(stream->isContextStream());
+        EXPECT_EQ((std::vector<int>{0, 1, 2, 3}), stream->getCompleteTokenIds()->completeTokenIdsVec(0));
+    };
+    auto configure_publication = [&](FakeModel& model, PublicationOutcome outcome, int& waits) {
+        model.setPublicationObserver([&, counter = &waits] {
+            ++*counter;
+            assert_not_dispatched();
+        });
+        if (outcome == PublicationOutcome::Error) {
+            model.setPublicationResult("store publication failed");
+        } else if (outcome == PublicationOutcome::Exception) {
+            model.setPublicationException(std::make_exception_ptr(std::runtime_error("store wait threw")));
+        }
+    };
+    configure_publication(*components.fake_target_model, publication.target, target_waits);
+    configure_publication(*components.fake_draft_prefill_model, publication.draft, draft_waits);
+    PublicationCollectives collectives([&](bool reported_local_ok) {
+        ++reductions;
+        EXPECT_EQ(target_waits, 1);
+        EXPECT_EQ(draft_waits, 1);
+        EXPECT_EQ(reported_local_ok, local_ok);
+        assert_not_dispatched();
+        return reported_local_ok && publication.peer_ok;
+    });
 
     GptModelInputs commit_input     = target_input;
     commit_input.last_hidden_states = target_output.all_hidden_states;
@@ -1787,7 +1892,9 @@ TEST_F(MtpExecutorTest, testDSparkPublicationFailurePreventsPrefillDispatch) {
     components.fake_sampler->setInputs({sampler_input});
     components.fake_sampler->setOutputs({sampler_output});
 
+    auto* target_model  = components.fake_target_model.get();
     auto* draft_prefill = components.fake_draft_prefill_model.get();
+    auto* draft_model   = components.fake_draft_model.get();
     setupFakeModels(components.executor.get(),
                     std::move(components.fake_target_model),
                     std::move(components.fake_draft_model),
@@ -1798,12 +1905,38 @@ TEST_F(MtpExecutorTest, testDSparkPublicationFailurePreventsPrefillDispatch) {
 
     auto status = components.executor->process(ScheduleOutput{{stream}});
     ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(target_model->forwardCount(), 1u);
     EXPECT_EQ(draft_prefill->forwardCount(), 1u);
-    EXPECT_TRUE(draft_waited);
-    EXPECT_TRUE(stream->hasError());
-    EXPECT_EQ(stream->statusInfo().code(), ErrorCode::CACHE_STORE_STORE_FAILED);
-    EXPECT_EQ((std::vector<int>{0, 1, 2, 3}), stream->getCompleteTokenIds()->completeTokenIdsVec(0));
+    EXPECT_EQ(draft_model->forwardCount(), 0u);
+    EXPECT_EQ(target_waits, 1);
+    EXPECT_EQ(draft_waits, 1);
+    EXPECT_EQ(reductions, publication.tp_size > 1 ? 1 : 0);
+    EXPECT_EQ(stream->hasError(), !success);
+    /** specUpdate clears context before checking errors, so unchanged tokens alone cannot exclude dispatch. */
+    EXPECT_EQ(stream->isContextStream(), !success);
+    if (success) {
+        EXPECT_EQ((std::vector<int>{0, 1, 2, 3, 1}), stream->getCompleteTokenIds()->completeTokenIdsVec(0));
+    } else {
+        EXPECT_EQ(stream->statusInfo().code(), ErrorCode::CACHE_STORE_STORE_FAILED);
+        EXPECT_EQ((std::vector<int>{0, 1, 2, 3}), stream->getCompleteTokenIds()->completeTokenIdsVec(0));
+    }
+    EXPECT_TRUE(stream->getProposeToken().empty());
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    DSpark,
+    MtpExecutorPublicationTest,
+    ::testing::Values(
+        PublicationCase{"SingleRankSuccess", 1, PublicationOutcome::Success, PublicationOutcome::Success, true},
+        PublicationCase{"SingleRankBothFail", 1, PublicationOutcome::Exception, PublicationOutcome::Error, true},
+        PublicationCase{"AllRanksSuccess", 2, PublicationOutcome::Success, PublicationOutcome::Success, true},
+        PublicationCase{"PeerOnlyFailure", 2, PublicationOutcome::Success, PublicationOutcome::Success, false},
+        PublicationCase{"TargetError", 2, PublicationOutcome::Error, PublicationOutcome::Success, true},
+        PublicationCase{"DraftError", 2, PublicationOutcome::Success, PublicationOutcome::Error, true},
+        PublicationCase{"TargetException", 2, PublicationOutcome::Exception, PublicationOutcome::Success, true},
+        PublicationCase{"DraftException", 2, PublicationOutcome::Success, PublicationOutcome::Exception, true},
+        PublicationCase{"BothFail", 2, PublicationOutcome::Exception, PublicationOutcome::Error, true}),
+    [](const ::testing::TestParamInfo<PublicationCase>& info) { return info.param.name; });
 
 TEST_F(MtpExecutorTest, testMultiBatchPrefill) {
     MtpExecutorTestConfig test_config;

@@ -659,7 +659,7 @@ void PPExecutor::prepareStreams(std::list<GenerateStreamPtr>& streams) {
                 sp_output_buffer->tokens.defined() && sp_output_buffer->tokens.device().is_cpu()
                     && sp_output_buffer->tokens.scalar_type() == torch::kInt32 && sp_output_buffer->tokens.is_contiguous()
                     && sp_output_buffer->tokens.numel() == token_count,
-                "PP speculative token buffer must contain one target token and %zu draft tokens, request_id=%ld",
+                "PP speculative token buffer must contain one target token and %ld draft tokens, request_id=%ld",
                 propose_step_,
                 stream->streamId());
             sp_output_buffer->propose_step = propose_step_;
@@ -843,13 +843,17 @@ void PPExecutor::prepareDraftPrefillAfterTargetPrefill(GptModelInputs&      draf
 void PPExecutor::prepareDraftPrefillAfterVerify(GptModelInputs&      draft_prefill_input,
                                                 const torch::Tensor& target_hidden_states,
                                                 const torch::Tensor& accepted_token_ids,
-                                                const torch::Tensor& accepted_lengths) {
+                                                const torch::Tensor& accepted_lengths,
+                                                torch::Tensor&       hidden_states_d_t) {
     mtp::prepareDraftPrefillAfterVerify(draft_prefill_input,
                                         target_hidden_states,
                                         accepted_token_ids,
                                         accepted_lengths,
+                                        draft_prefill_input.input_lengths.numel(),
+                                        propose_step_,
                                         draft_input_layout_,
                                         position_id_len_factor_,
+                                        hidden_states_d_t,
                                         buffer_holder_);
 }
 
@@ -1011,6 +1015,7 @@ void PPExecutor::runDraftStep(GptModelInputs&       target_input,
     auto&          proposed_token_ids = execution_result.propose_token_ids;
     auto&          proposed_all_probs = execution_result.propose_all_probs;
     GptModelInputs draft_input        = target_input;
+    torch::Tensor  hidden_states_d_t;
     draft_input.skip_lm_head          = false;
     draft_input.pd_separation         = target_input.pd_separation && !target_input.skip_lm_head;
 
@@ -1021,7 +1026,8 @@ void PPExecutor::runDraftStep(GptModelInputs&       target_input,
             prepareDSparkCommitInput(draft_input, target_hidden_states);
         } else if (isStageRoot()) {
             if (is_decode) {
-                prepareDraftPrefillAfterVerify(draft_input, target_hidden_states, new_token_ids, new_token_lengths);
+                prepareDraftPrefillAfterVerify(
+                    draft_input, target_hidden_states, new_token_ids, new_token_lengths, hidden_states_d_t);
             } else {
                 prepareDraftPrefillAfterTargetPrefill(
                     draft_input, target_hidden_states, new_token_ids, draft_next_position_ids);
@@ -1142,7 +1148,7 @@ void PPExecutor::runDraftStep(GptModelInputs&       target_input,
                 proposed_all_probs        = draft_sampler_output.all_probs;
             }
         } else {
-            for (size_t step = 1; step < propose_step_; ++step) {
+            for (int64_t step = 1; step < propose_step_; ++step) {
                 tpSyncModelInputs(draft_input, parallelism_config_);
                 auto draft_output = forwardDraftModel(*draft_model_, draft_input);
                 mtp::maybeOverrideLastHiddenWithMtpBuffer(

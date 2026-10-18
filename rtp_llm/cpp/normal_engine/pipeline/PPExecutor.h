@@ -142,7 +142,8 @@ private:
     void prepareDraftPrefillAfterVerify(GptModelInputs&      draft_prefill_input,
                                         const torch::Tensor& target_hidden_states,
                                         const torch::Tensor& accepted_token_ids,
-                                        const torch::Tensor& accepted_lengths);
+                                        const torch::Tensor& accepted_lengths,
+                                        torch::Tensor&       hidden_states_d_t);
 
     void prepareDSparkCommitInput(GptModelInputs& commit_input, const torch::Tensor& target_features);
 
@@ -224,7 +225,7 @@ private:
     bool    is_dspark_                 = false;
     int32_t dspark_mask_token_id_      = -1;
     bool    dspark_sample_from_anchor_ = true;
-    size_t  propose_step_              = 0;
+    int64_t propose_step_              = 0;
     size_t  position_id_len_factor_    = 1;
     /** PP currently publishes host state; keep layout selection on the shared device-state policy. */
     const mtp::DraftInputLayout                      draft_input_layout_ = mtp::selectDraftInputLayout(false);

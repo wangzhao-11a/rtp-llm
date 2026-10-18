@@ -1197,10 +1197,11 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
     GptModelInputs&                              model_input,
     const GptModelOutputs&                       model_output,
     const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+    const size_t                                 batch_size,
     torch::Tensor&                               hidden_states_d_t,
     TensorHolder&                                host_holder) {
     const auto layout = draftInputLayout();
-    /** Preserve the existing COMPACT wait boundary; FIXED_WIDTH never consumes the CPU mirrors here. */
+    /** COMPACT consumes host mirrors that may still be awaiting the sampler's D2H transfer. */
     const auto accepted = layout == mtp::DraftInputLayout::FIXED_WIDTH ?
                               mtp::getDeviceAcceptedTokens(speculative_sampler_output) :
                               mtp::getHostAcceptedTokens(speculative_sampler_output,
@@ -1210,10 +1211,12 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
                                         model_output.all_hidden_states,
                                         accepted.token_ids,
                                         accepted.lengths,
+                                        batch_size,
+                                        propose_step_,
                                         layout,
                                         model_input_gatherer_config_.position_id_len_factor,
+                                        hidden_states_d_t,
                                         host_holder);
-    hidden_states_d_t = model_input.last_hidden_states;
 }
 
 void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups& stream_groups,

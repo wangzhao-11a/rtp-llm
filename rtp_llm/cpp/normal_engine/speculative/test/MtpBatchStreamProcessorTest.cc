@@ -830,7 +830,7 @@ TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
         };
     expect_positions(model_input, {1, 2}, {1, 2});
 
-    // Legacy GPU propose-token path receives the normal decode position.
+    /** GPU proposals from the stream output buffer use the normal decode position. */
     stream1->getSPOutputBuffer()->propose_tokens_gpu = torch::tensor({{3}}, torch::kInt32).to(torch::kCUDA);
     stream2->getSPOutputBuffer()->propose_tokens_gpu = torch::tensor({{1}}, torch::kInt32).to(torch::kCUDA);
     model_input.sequence_lengths                     = torch::tensor({4, 5}, torch::kInt32);
@@ -857,8 +857,7 @@ TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
 }
 
 TEST_F(MtpBatchStreamProcessorTest, DraftCacheWritesRemainContiguousAcrossPreparationPaths) {
-    // This test exercises the legacy compact post-rejection path; device-state
-    // preparation below is selected by explicitly supplied stream state.
+    /** COMPACT layout; preparation below supplies stream state explicitly. */
     autil::EnvGuard             stream_async("RTP_LLM_STREAM_ASYNC", "0");
     autil::EnvGuard             device_state("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "0");
     ModelConfig                 model_config;
@@ -897,9 +896,8 @@ TEST_F(MtpBatchStreamProcessorTest, DraftCacheWritesRemainContiguousAcrossPrepar
         EXPECT_EQ(2, toVec<int>(prefill.combo_tokens).back());
         const int first_unwritten_slot = toVec<int>(prefill.prefix_lengths)[0] + toVec<int>(prefill.input_lengths)[0];
 
-        // Supply the same logical position through CPU, legacy GPU, incomplete
-        // GPU state, and complete committed-length state. Physical block IDs
-        // and explicit positional coordinates must not be rewritten.
+        /** Host state, GPU proposals and partial/full device state must agree on the next KV slot
+         * without changing physical block IDs or explicit position IDs. */
         for (int path = 0; path < 4; ++path) {
             SCOPED_TRACE(path);
             stream->setMtpAsyncDeviceState({});
@@ -951,7 +949,7 @@ TEST_F(MtpBatchStreamProcessorTest, DraftCacheWritesRemainContiguousAcrossPrepar
             GptModelOutputs verified;
             verified.all_hidden_states = torch::zeros({5, 2});
             torch::Tensor selected_hidden;
-            processor.updateDecodePostDraftModelInput(post, verified, rejection, selected_hidden, holder);
+            processor.updateDecodePostDraftModelInput(post, verified, rejection, 1, selected_hidden, holder);
             ASSERT_EQ((vector<int>{accepted}), toVec<int>(post.input_lengths));
             ASSERT_EQ((vector<int>{first_unwritten_slot}), toVec<int>(post.prefix_lengths));
             const int      next_slot = toVec<int>(post.prefix_lengths)[0] + toVec<int>(post.input_lengths)[0];
@@ -1308,7 +1306,7 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInput) {
             .reshape({6, 2});
 
     processor.updateDecodePostDraftModelInput(
-        model_input, model_output, spec_decode_output, hidden_states_d_t, holder);
+        model_input, model_output, spec_decode_output, stream_groups.size(), hidden_states_d_t, holder);
 
     auto        combo_tokens        = model_input.combo_tokens.cpu();
     vector<int> expect_combo_tokens = {2, 3, 1, 2};
@@ -1357,7 +1355,7 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInputKeepsDens
     TensorHolder  holder;
 
     processor.updateDecodePostDraftModelInput(
-        model_input, model_output, spec_decode_output, hidden_states_d_t, holder);
+        model_input, model_output, spec_decode_output, 2, hidden_states_d_t, holder);
 
     EXPECT_TRUE(model_input.combo_tokens.is_cuda());
     EXPECT_EQ((vector<int>{2, 3, 1, 2, 0, 0}), toVec<int>(model_input.combo_tokens));
@@ -1451,7 +1449,8 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInputCompactsC
                                                    torch::kFloat32)
                                          .reshape({9, 2});
 
-    processor.updateDecodePostDraftModelInput(model_input, model_output, spec_decode_output, hidden_states_d_t, holder);
+    processor.updateDecodePostDraftModelInput(
+        model_input, model_output, spec_decode_output, stream_groups.size(), hidden_states_d_t, holder);
 
     auto        combo_position_ids        = model_input.combo_position_ids;
     vector<int> expect_combo_position_ids = {10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 70, 71, 72};

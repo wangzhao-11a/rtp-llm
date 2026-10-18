@@ -1,9 +1,16 @@
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "torch/all.h"
 #include "gtest/gtest.h"
 
+#include "rtp_llm/cpp/models/logits_processor/SpecLogitsProcessor.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpCompute.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 
@@ -18,6 +25,216 @@ std::vector<T> toVec(const torch::Tensor& t) {
 }
 
 class MtpComputeTest: public DeviceTestBase {};
+
+#if USING_CUDA
+namespace {
+
+/** Keep GPU work pending until the test releases it; timeout also drains a failing test. */
+class CudaStreamGate {
+public:
+    explicit CudaStreamGate(const torch::Stream& stream): stream_(stream) {
+        const auto error = cudaLaunchHostFunc(cuda_graph::toGraphStream(stream).stream(), [](void* arg) {
+            auto& gate = *static_cast<CudaStreamGate*>(arg);
+            std::unique_lock<std::mutex> lock(gate.mutex_);
+            gate.entered_ = true;
+            gate.cv_.notify_all();
+            gate.timed_out_ = !gate.cv_.wait_for(lock, std::chrono::seconds(10), [&] { return gate.released_; });
+        }, this);
+        TORCH_CHECK(error == cudaSuccess, cudaGetErrorString(error));
+    }
+
+    ~CudaStreamGate() {
+        release();
+        stream_.synchronize();
+    }
+
+    bool waitUntilEntered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return entered_; });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    bool timedOut() const {
+        return timed_out_.load();
+    }
+
+private:
+    torch::Stream           stream_;
+    std::mutex              mutex_;
+    std::condition_variable cv_;
+    bool                    entered_ = false;
+    bool                    released_ = false;
+    std::atomic<bool>       timed_out_{false};
+};
+
+/** Sampling values are fixed so only the real cap, transfer and event protocol is under test. */
+class CapInputSampler: public speculative::SpeculativeSampler {
+public:
+    CapInputSampler(): speculative::SpeculativeSampler({}, 2) {
+        tokens_  = torch::tensor({{1, 2, 10}}, torch::kInt32).cuda();
+        lengths_ = torch::tensor({3}, torch::kInt32).cuda();
+    }
+
+    speculative::SpeculativeSamplerOutput forward(const speculative::SpeculativeSamplingParams&,
+                                                   SamplerOutput&,
+                                                   SamplerOutput&) override {
+        speculative::SpeculativeSamplerOutput output;
+        output.accept_tokens = tokens_;
+        output.accept_len = lengths_;
+        return output;
+    }
+
+private:
+    torch::Tensor tokens_;
+    torch::Tensor lengths_;
+};
+
+class RoundCapProcessor: public BaseLogitsProcessor {
+public:
+    explicit RoundCapProcessor(int cap): cap_(cap) {}
+    std::optional<ErrorInfo> process(const SamplerInputs&, size_t, size_t) override {
+        return std::nullopt;
+    }
+    void updateMultiSeqStatus(const std::vector<int>&) override {}
+    std::optional<ErrorInfo> updateStatus(const torch::Tensor&, int32_t) override {
+        return std::nullopt;
+    }
+    MtpProcessorCapability mtpCapability() const override {
+        return {MtpProcessorMode::SPEC_VERIFY, "round cap test"};
+    }
+    ErrorResult<int> prepareSpeculative(const SpecLogitsProcessorRequest&) override {
+        ++calls;
+        return ErrorResult<int>(static_cast<int>(cap_));
+    }
+    std::atomic<int> calls{0};
+
+private:
+    int cap_;
+};
+
+speculative::SpeculativeSamplerOutput consumeCap(const torch::Stream& stream,
+                                                 CapInputSampler&     sampler,
+                                                 SamplerOutput&       target,
+                                                 const SpecLogitsVerifyRunner::LaunchResult& result) {
+    cuda_graph::GraphStreamGuard guard(cuda_graph::toGraphStream(stream));
+    SamplerOutput draft;
+    speculative::SpeculativeSamplerOutput output;
+    mtp::runRejectionSampling(sampler, {}, draft, target, result, output);
+    return output;
+}
+
+void expectCappedOutput(const speculative::SpeculativeSamplerOutput& output, int cap) {
+    output.transfer_done_event->synchronize();
+    const std::vector<int32_t> tokens = cap == 0 ? std::vector<int32_t>{8, 2, 10} :
+                                                 std::vector<int32_t>{1, 9, 10};
+    EXPECT_EQ(toVec<int32_t>(output.accept_len_cpu), (std::vector<int32_t>{cap + 1}));
+    EXPECT_EQ(toVec<int32_t>(output.accept_len), (std::vector<int32_t>{cap + 1}));
+    EXPECT_EQ(toVec<int32_t>(output.accept_tokens_cpu), tokens);
+    EXPECT_EQ(toVec<int32_t>(output.accept_tokens), tokens);
+}
+
+}
+
+TEST_F(MtpComputeTest, RejectionWaitsForCapProducedOnAnotherStream) {
+    const auto producer = cuda_graph::graphGetStreamFromPool(false);
+    const auto consumer = cuda_graph::graphGetStreamFromPool(false);
+    ASSERT_NE(producer, consumer);
+    CapInputSampler sampler;
+    SamplerOutput target;
+    target.token_ids = torch::tensor({{8}, {9}, {10}}, torch::kInt32).cuda();
+    SpecLogitsVerifyRunner::LaunchResult result;
+    result.spec_cap_gpu = torch::tensor({1}, torch::kInt32).cuda();
+    result.ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    result.consumed_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    {
+        cuda_graph::GraphStreamGuard guard(cuda_graph::toGraphStream(producer));
+        /** Load the producer kernel and initialize its event before holding GPU work pending. */
+        result.spec_cap_gpu.fill_(1);
+        result.ready_event->record(producer);
+    }
+    cuda_graph::graphDeviceSynchronize();
+    /** Warm allocator/kernel paths before blocking a stream; setup sync is outside the tested interval. */
+    consumeCap(consumer, sampler, target, result).transfer_done_event->synchronize();
+
+    CudaStreamGate gate(producer);
+    ASSERT_TRUE(gate.waitUntilEntered());
+    {
+        cuda_graph::GraphStreamGuard guard(cuda_graph::toGraphStream(producer));
+        result.spec_cap_gpu.fill_(0);
+        result.ready_event->record(producer);
+    }
+    std::promise<void> started;
+    auto completed = std::async(std::launch::async, [&] {
+        started.set_value();
+        auto output = consumeCap(consumer, sampler, target, result);
+        output.transfer_done_event->synchronize();
+        return output;
+    });
+    started.get_future().wait();
+    EXPECT_EQ(completed.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    gate.release();
+    expectCappedOutput(completed.get(), 0);
+    EXPECT_FALSE(gate.timedOut());
+}
+
+TEST_F(MtpComputeTest, RejectionConsumptionProtectsRunnerBuffersAcrossRounds) {
+    const auto producer = cuda_graph::graphGetStreamFromPool(false);
+    const auto consumer = cuda_graph::graphGetStreamFromPool(false);
+    ASSERT_NE(producer, consumer);
+    CapInputSampler sampler;
+    SamplerOutput target;
+    target.token_ids = torch::tensor({{8}, {9}, {10}}, torch::kInt32).cuda();
+    auto first_processor = std::make_shared<RoundCapProcessor>(1);
+    auto next_processor = std::make_shared<RoundCapProcessor>(0);
+    SpecLogitsVerifyRunner::LaunchTask task;
+    task.total_streams = 1;
+    task.propose_step = 2;
+    task.vocab_size = 16;
+    task.draft_tokens = torch::tensor({{1, 2}}, torch::kInt32);
+    task.active = {{first_processor, 0}};
+    SpecLogitsVerifyRunner runner;
+    auto produce = [&](const SpecLogitsVerifyRunner::LaunchTask& input) {
+        cuda_graph::GraphStreamGuard guard(cuda_graph::toGraphStream(producer));
+        return runner.run(input);
+    };
+    cuda_graph::graphDeviceSynchronize();
+    auto warmup = produce(task);
+    consumeCap(consumer, sampler, target, warmup).transfer_done_event->synchronize();
+    auto first = produce(task);
+    first.ready_event->synchronize();
+    const auto* cpu_storage = first.spec_cap_cpu.data_ptr();
+    const auto* gpu_storage = first.spec_cap_gpu.data_ptr();
+
+    CudaStreamGate gate(consumer);
+    ASSERT_TRUE(gate.waitUntilEntered());
+    auto first_output = consumeCap(consumer, sampler, target, first);
+    EXPECT_FALSE(first.consumed_event->query());
+    auto next_task = task;
+    next_task.active = {{next_processor, 0}};
+    std::promise<void> started;
+    auto next = std::async(std::launch::async, [&] {
+        started.set_value();
+        return produce(next_task);
+    });
+    started.get_future().wait();
+    EXPECT_EQ(next.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    EXPECT_EQ(next_processor->calls.load(), 0);
+    gate.release();
+    auto second = next.get();
+    expectCappedOutput(first_output, 1);
+    EXPECT_EQ(second.spec_cap_cpu.data_ptr(), cpu_storage);
+    EXPECT_EQ(second.spec_cap_gpu.data_ptr(), gpu_storage);
+    expectCappedOutput(consumeCap(consumer, sampler, target, second), 0);
+    EXPECT_EQ(first_processor->calls.load(), 2);
+    EXPECT_EQ(next_processor->calls.load(), 1);
+    EXPECT_FALSE(gate.timedOut());
+}
+#endif
 
 TEST_F(MtpComputeTest, DSparkPublicationReportsPeerFailureAfterBothLocalWaits) {
     struct PublicationModel: public ModelBase {
@@ -329,10 +546,19 @@ TEST_F(MtpComputeTest, SharedDecodeInputCompactsDifferentAcceptLengths) {
         auto accepted_lengths = torch::tensor({1, 3}, torch::kInt32).to(device);
         auto accepted_token_ids = torch::tensor({{4, 0, 0}, {5, 6, 7}}, torch::kInt32).to(device);
         auto draft_input = verify_input;
+        torch::Tensor hidden_states_d_t;
         TensorHolder holder;
 
-        mtp::prepareDraftPrefillAfterVerify(
-            draft_input, hidden_states, accepted_token_ids, accepted_lengths, mtp::DraftInputLayout::COMPACT, 1, holder);
+        mtp::prepareDraftPrefillAfterVerify(draft_input,
+                                           hidden_states,
+                                           accepted_token_ids,
+                                           accepted_lengths,
+                                           2,
+                                           2,
+                                           mtp::DraftInputLayout::COMPACT,
+                                           1,
+                                           hidden_states_d_t,
+                                           holder);
 
         EXPECT_EQ(toVec<int32_t>(draft_input.combo_tokens), (std::vector<int32_t>{4, 5, 6, 7}));
         EXPECT_EQ(toVec<int32_t>(draft_input.input_lengths), (std::vector<int32_t>{1, 3}));
@@ -347,6 +573,63 @@ TEST_F(MtpComputeTest, SharedDecodeInputCompactsDifferentAcceptLengths) {
         EXPECT_TRUE(verify_input.is_target_verify);
         EXPECT_EQ(toVec<int32_t>(verify_input.combo_position_ids), (std::vector<int32_t>{10, 11, 12, 20, 21, 22}));
         EXPECT_EQ(toVec<int32_t>(accepted_token_ids), (std::vector<int32_t>{4, 0, 0, 5, 6, 7}));
+    }
+}
+
+TEST_F(MtpComputeTest, SharedDecodeInputRejectsAcceptLengthBatchMismatch) {
+    for (int length_count : {1, 3}) {
+        SCOPED_TRACE(length_count);
+        GptModelInputs draft_input;
+        torch::Tensor  hidden_states_d_t;
+        TensorHolder   holder;
+        auto hidden_states    = torch::zeros({6, 2});
+        auto accepted_tokens  = torch::zeros({2, 3}, torch::kInt32);
+        auto accepted_lengths = torch::ones({length_count}, torch::kInt32);
+
+        try {
+            mtp::prepareDraftPrefillAfterVerify(draft_input,
+                                               hidden_states,
+                                               accepted_tokens,
+                                               accepted_lengths,
+                                               2,
+                                               2,
+                                               mtp::DraftInputLayout::COMPACT,
+                                               1,
+                                               hidden_states_d_t,
+                                               holder);
+            FAIL() << "Expected accept_len batch mismatch";
+        } catch (const std::runtime_error& error) {
+            EXPECT_NE(std::string(error.what()).find("accept_len batch mismatch"), std::string::npos);
+        }
+    }
+}
+
+TEST_F(MtpComputeTest, SharedDecodeInputRejectsInvalidAcceptLengths) {
+    for (const auto& lengths : std::vector<std::vector<int32_t>>{{4}, {4, 1}, {1, 4}, {0, 1}}) {
+        SCOPED_TRACE(::testing::PrintToString(lengths));
+        const auto batch_size = static_cast<int64_t>(lengths.size());
+        GptModelInputs draft_input;
+        torch::Tensor  hidden_states_d_t;
+        TensorHolder   holder;
+        auto hidden_states    = torch::zeros({batch_size * 3, 2});
+        auto accepted_tokens  = torch::arange(batch_size * 3, torch::kInt32).reshape({batch_size, 3});
+        auto accepted_lengths = torch::tensor(lengths, torch::kInt32);
+
+        try {
+            mtp::prepareDraftPrefillAfterVerify(draft_input,
+                                               hidden_states,
+                                               accepted_tokens,
+                                               accepted_lengths,
+                                               batch_size,
+                                               2,
+                                               mtp::DraftInputLayout::COMPACT,
+                                               1,
+                                               hidden_states_d_t,
+                                               holder);
+            FAIL() << "Expected invalid accept_len";
+        } catch (const std::runtime_error& error) {
+            EXPECT_NE(std::string(error.what()).find("invalid accept_len"), std::string::npos);
+        }
     }
 }
 
@@ -433,9 +716,12 @@ TEST_F(MtpComputeTest, SharedDraftContinuationUsesValidLengthsForBothLayouts) {
             auto accepted_tokens = torch::tensor({{31, 0, 0}, {41, 42, 0}}, torch::kInt32).cuda();
             auto accepted_lengths = torch::tensor({1, 2}, torch::kInt32).cuda();
             auto input = verify;
+            torch::Tensor hidden_states_d_t;
             TensorHolder holder;
             mtp::prepareDraftPrefillAfterVerify(
-                input, target_hidden, accepted_tokens, accepted_lengths, layout, 3, holder);
+                input, target_hidden, accepted_tokens, accepted_lengths, 2, 2, layout, 3, hidden_states_d_t, holder);
+            ASSERT_EQ(hidden_states_d_t.unsafeGetTensorImpl(), input.last_hidden_states.unsafeGetTensorImpl());
+            const auto prefill_hidden_before_decode = input.last_hidden_states.cpu();
             EXPECT_EQ(input.combo_tokens.numel(), device_state ? 6 : 3);
             EXPECT_EQ(toVec<int32_t>(input.lm_output_indexes),
                       device_state ? (std::vector<int32_t>{0, 4}) : (std::vector<int32_t>{0, 2}));
@@ -447,6 +733,7 @@ TEST_F(MtpComputeTest, SharedDraftContinuationUsesValidLengthsForBothLayouts) {
                 input, draft_hidden, torch::tensor({{50}, {60}}, torch::kInt32).cuda(), 3);
             draft_hidden.fill_(-1);
             EXPECT_TRUE(torch::equal(input.last_hidden_states, expected_hidden));
+            EXPECT_TRUE(torch::equal(hidden_states_d_t.cpu(), prefill_hidden_before_decode));
             EXPECT_EQ(toVec<int32_t>(input.combo_tokens), (std::vector<int32_t>{50, 60}));
             EXPECT_EQ(toVec<int32_t>(input.input_lengths), (std::vector<int32_t>{1, 1}));
             EXPECT_EQ(toVec<int32_t>(input.sequence_lengths), (std::vector<int32_t>{8, 13}));
@@ -560,9 +847,6 @@ TEST_F(MtpComputeTest, SharedRejectionAppliesCapBeforeCpuTransfer) {
         if (device_cap) {
             verify_result.spec_cap_gpu = verify_result.spec_cap_cpu.cuda();
             verify_result.spec_cap_cpu = torch::zeros_like(verify_result.spec_cap_cpu);
-            verify_result.ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
-            verify_result.ready_event->record(cuda_graph::graphGetCurrentStream());
-            verify_result.consumed_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
         }
         verify_result.processor_errors.resize(3);
         verify_result.processor_errors[1] = ErrorInfo(ErrorCode::INVALID_PARAMS, "speculative cap failed");
@@ -592,9 +876,6 @@ TEST_F(MtpComputeTest, SharedRejectionAppliesCapBeforeCpuTransfer) {
         EXPECT_EQ(accepted.processor_errors[1]->code(), ErrorCode::INVALID_PARAMS);
         EXPECT_EQ(accepted.processor_errors[1]->ToString(), "speculative cap failed");
         EXPECT_FALSE(accepted.processor_errors[2].has_value());
-        if (verify_result.consumed_event) {
-            verify_result.consumed_event->synchronize();
-        }
     }
 }
 

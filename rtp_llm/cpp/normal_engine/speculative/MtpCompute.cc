@@ -466,24 +466,31 @@ void prepareDraftPrefillAfterVerify(GptModelInputs&      draft_input,
                                     const torch::Tensor& target_hidden_states,
                                     const torch::Tensor& accepted_token_ids,
                                     const torch::Tensor& accepted_lengths,
+                                    size_t               batch_size,
+                                    int64_t              propose_step,
                                     DraftInputLayout     layout,
                                     size_t               position_id_len_factor,
+                                    torch::Tensor&       hidden_states_d_t,
                                     TensorHolder&        host_holder) {
-    const size_t batch_size         = accepted_lengths.numel();
-    const auto   tokens_per_request = accepted_token_ids.size(1);
+    const auto   tokens_per_request = propose_step + 1;
     draft_input.is_target_verify    = false;
     if (layout == DraftInputLayout::FIXED_WIDTH) {
-        const auto total_tokens = accepted_token_ids.numel();
+        const auto total_tokens = static_cast<int64_t>(batch_size) * tokens_per_request;
         draft_input.combo_tokens = toCudaInt32(accepted_token_ids.reshape({total_tokens}), host_holder);
         auto accepted_lengths_gpu = toCudaInt32(accepted_lengths, host_holder);
         draft_input.lm_output_indexes =
             torch::arange(0, total_tokens, tokens_per_request, accepted_lengths_gpu.options()) + (accepted_lengths_gpu - 1);
         draft_input.last_hidden_states = target_hidden_states;
+        hidden_states_d_t              = draft_input.last_hidden_states;
         return;
     }
 
     const auto      accepted_token_ids_cpu = accepted_token_ids.cpu().contiguous();
     const auto      accepted_lengths_cpu   = accepted_lengths.cpu().contiguous();
+    RTP_LLM_CHECK_WITH_INFO(accepted_lengths_cpu.numel() == static_cast<int64_t>(batch_size),
+                            "accept_len batch mismatch: %ld != %zu",
+                            accepted_lengths_cpu.numel(),
+                            batch_size);
     const auto*     accepted_lengths_ptr   = accepted_lengths_cpu.data_ptr<int32_t>();
     std::vector<int> accepted_lengths_per_request(batch_size);
     size_t          total_accepted_tokens = 0;
@@ -507,6 +514,12 @@ void prepareDraftPrefillAfterVerify(GptModelInputs&      draft_input,
     std::vector<torch::Tensor> accepted_hidden_states;
     accepted_hidden_states.reserve(batch_size);
     for (size_t i = 0; i < batch_size; ++i) {
+        RTP_LLM_CHECK_WITH_INFO(accepted_lengths_per_request[i] > 0
+                                    && accepted_lengths_per_request[i] <= propose_step + 1,
+                                "invalid accept_len[%zu]=%d for propose_step=%ld",
+                                i,
+                                accepted_lengths_per_request[i],
+                                propose_step);
         memcpy(combo_tokens_ptr + token_offset,
                accepted_token_ids_ptr + i * tokens_per_request,
                accepted_lengths_per_request[i] * sizeof(int32_t));
@@ -520,7 +533,8 @@ void prepareDraftPrefillAfterVerify(GptModelInputs&      draft_input,
     draft_input.combo_tokens       = std::move(combo_tokens);
     draft_input.input_lengths      = std::move(input_lengths);
     draft_input.lm_output_indexes  = std::move(lm_output_indexes);
-    draft_input.last_hidden_states = torch::cat(accepted_hidden_states).contiguous();
+    hidden_states_d_t              = torch::cat(accepted_hidden_states).contiguous();
+    draft_input.last_hidden_states = hidden_states_d_t;
     auto verify_position_ids = draft_input.combo_position_ids.defined() && draft_input.combo_position_ids.is_cuda() ?
                                    draft_input.combo_position_ids.cpu().contiguous() :
                                    draft_input.combo_position_ids;

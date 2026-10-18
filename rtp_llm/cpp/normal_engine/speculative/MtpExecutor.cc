@@ -1571,7 +1571,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 model_input, model_output.all_hidden_states, batch_size);
         } else {
             batch_stream_processor_->updateDecodePostDraftModelInput(
-                model_input, model_output, speculative_sampler_output, hidden_states_d_t, buffer_holder_);
+                model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, buffer_holder_);
         }
         if (metrics_reporter_) {
             accept_len_ready_event.record(cuda_graph::graphGetCurrentStream());
