@@ -12,6 +12,7 @@ available.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import math
 import os
@@ -53,6 +54,31 @@ _MEGA_MOE_NVCC_TMPDIR_ENV = "MEGA_MOE_NVCC_TMPDIR"
 _PRE_KERNEL_BARRIER_ENV = "MEGA_MOE_PRE_KERNEL_BARRIER"
 _PRE_KERNEL_BARRIER_VERBOSE_ENV = "MEGA_MOE_PRE_KERNEL_BARRIER_VERBOSE"
 _PRE_KERNEL_BARRIER_LOGGED_KEYS: set[tuple[int, int]] = set()
+
+
+def _record_moe_activation_evidence(
+    kernel, activation, gate_beta, up_beta, kwargs, layer_id, execution_path
+):
+    if os.environ.get("RTP_LLM_SMOKE_EVIDENCE") != "1" or activation != "situ":
+        return
+    logging.info(
+        "[RTP_MOE_ACTIVATION] %s",
+        json.dumps(
+            {
+                "activation": activation,
+                "backend": (
+                    f"{getattr(kernel, '__module__', 'deep_gemm')}."
+                    f"{getattr(kernel, '__name__', 'fp8_fp4_mega_moe')}"
+                ),
+                "gate_beta": gate_beta,
+                "up_beta": up_beta,
+                "kwargs": dict(kwargs),
+                "layer_id": layer_id,
+                "execution_path": execution_path,
+            },
+            allow_nan=False,
+        ),
+    )
 
 
 def situ_kwargs(kernel, gate_beta, up_beta):
@@ -322,6 +348,16 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
         )
         self._input_packer = get_mega_moe_input_packer()
         self._maybe_warmup_jit_once()
+        if self._activation == "situ":
+            _record_moe_activation_evidence(
+                deep_gemm.fp8_fp4_mega_moe,
+                self._activation,
+                cfg.activation_beta,
+                cfg.activation_linear_beta,
+                self._activation_kwargs,
+                cfg.layer_id,
+                "mega_moe",
+            )
 
     def _resolve_jit_warmup_token_counts(self, num_sms: int) -> list[int]:
         cfg = self.cfg

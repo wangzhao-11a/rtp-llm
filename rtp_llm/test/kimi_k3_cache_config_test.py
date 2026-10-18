@@ -3,10 +3,33 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from rtp_llm.models.kimi_k3.kimi_k3 import KimiK3, KimiK3ModelConfig, KimiK3Mtp
+from rtp_llm.ops import DataType, KVCacheConfig, KvCacheDataType
 from rtp_llm.utils.model_weight import W
 
 
 class KimiK3MainCacheConfigTest(unittest.TestCase):
+    def test_model_precision_uses_fp8_mla_for_target_and_preserves_bf16_draft(self):
+        for model_type in ("kimi_k3", "kimi_k3_mtp"):
+            for enabled in (False, True):
+                with self.subTest(model_type=model_type, fp8_mla=enabled):
+                    config = KimiK3ModelConfig()
+                    config.model_type = model_type
+                    config.config_dtype = "bfloat16"
+                    config.quantization = ""
+                    cache_config = KVCacheConfig()
+                    # The generic cache flag does not select K3's MLA operands.
+                    cache_config.fp8_kv_cache = int(not enabled)
+                    with patch.dict("os.environ", {"FP8_MLA": str(int(enabled))}):
+                        config.init_precision_config(cache_config, "BF16")
+                    expect_fp8 = enabled and model_type == "kimi_k3"
+                    self.assertEqual(config.attn_config.mla_fp8_compute, expect_fp8)
+                    self.assertEqual(
+                        config.attn_config.kv_cache_dtype,
+                        KvCacheDataType.FP8 if expect_fp8 else KvCacheDataType.BASE,
+                    )
+                    self.assertEqual(config.data_type, DataType.TYPE_BF16)
+                    self.assertIsNone(config.attention_projection_quant_config)
+
     def test_kda_replay_cache_uses_per_channel_gate(self):
         config = KimiK3ModelConfig()
         KimiK3._parse_attention_config(
@@ -27,7 +50,6 @@ class KimiK3MainCacheConfigTest(unittest.TestCase):
         self.assertEqual(linear.linear_num_value_heads, 96)
         # KDA's forget gate has one value per key channel, not per head.
         self.assertTrue(linear.replay_vector_gate)
-
 
 
 class KimiK3MtpMediaTokenConfigTest(unittest.TestCase):

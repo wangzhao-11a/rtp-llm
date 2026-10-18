@@ -45,6 +45,7 @@ class _FusedSharedExperts(nn.Module):
         )
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe import (
             _get_validated_world_ep_group,
+            _record_moe_activation_evidence,
         )
         from rtp_llm.models_py.modules.factory.fused_moe.utils.mega_moe.input_packer import (
             get_mega_moe_input_packer,
@@ -120,6 +121,15 @@ class _FusedSharedExperts(nn.Module):
         self.beta = float(cfg.activation_beta)
         self.linear_beta = cfg.activation_linear_beta
         self.fp4_block = FP4_BLOCK
+        _record_moe_activation_evidence(
+            deep_gemm.fp8_fp4_mega_moe,
+            "situ",
+            self.beta,
+            self.linear_beta,
+            {"activation_beta": self.beta, "activation_linear_beta": self.linear_beta},
+            cfg.layer_id,
+            "k3_fused_shared",
+        )
 
     def forward(self, hidden, routed_input, routing, ids, valid_mask=None):
         import deep_gemm
