@@ -48,10 +48,11 @@ public:
     bool use_opaque_kv_cache_store                = false;
     bool disable_decode_first_malloc_device_reuse = false;
 
-    rtp_llm::DataType dtype     = rtp_llm::DataType::TYPE_INVALID;
-    uint32_t          layer_num = 0;  // the number of main model layers
-    bool              use_mla   = false;
-    bool              is_sparse = false;
+    rtp_llm::DataType dtype                             = rtp_llm::DataType::TYPE_INVALID;
+    uint32_t          layer_num                         = 0;  // the number of main model layers
+    bool              use_mla                           = false;
+    bool              is_sparse                         = false;
+    bool              supports_native_kv_cache_sharding = false;
 
     // Block configuration
     size_t seq_size_per_block = 1;  // tokens/base cache-key block; groups may cover multiple key blocks

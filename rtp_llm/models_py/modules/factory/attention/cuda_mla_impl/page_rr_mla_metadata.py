@@ -19,12 +19,23 @@ class PageRRMlaMetadata:
     """
 
     def __init__(
-        self, page_size: int, kernel_page_size: int, cp_size: int, cp_rank: int,
+        self,
+        page_size: int,
+        kernel_page_size: int,
+        cp_size: int,
+        cp_rank: int,
+        *,
+        table_layout: str = "compact",
     ):
         if page_size <= 0 or kernel_page_size <= 0 or page_size % kernel_page_size:
             raise ValueError("Page-RR ownership page must be a multiple of kernel page size")
         if cp_size <= 1 or not 0 <= cp_rank < cp_size:
             raise ValueError("Page-RR requires a valid rank in a multi-rank TP group")
+        if table_layout not in ("compact", "replicated"):
+            raise ValueError("Page-RR table_layout must be compact or replicated")
+        # Ownership is independent of the allocator's source table layout.
+        # A replicated table retains global physical pages on every rank.
+        self.table_replicated = table_layout == "replicated"
         self.page_size = page_size
         self.kernel_page_size = kernel_page_size
         self.cp_size = cp_size
@@ -67,7 +78,11 @@ class PageRRMlaMetadata:
                 or table.ndim != 2 or table.shape[0] != len(q_lens) or table.stride(1) != 1):
             raise ValueError("MLA Page-RR requires a group-current CUDA int32 page table")
         max_pages = (max(kv_lens) + self.page_size - 1) // self.page_size
-        required_pages = (max_pages + self.cp_size - 1 - self.cp_rank) // self.cp_size
+        required_pages = (
+            max_pages
+            if self.table_replicated
+            else (max_pages + self.cp_size - 1 - self.cp_rank) // self.cp_size
+        )
         required_pages *= self.page_size // self.kernel_page_size
         if required_pages > table.shape[1]:
             raise RuntimeError(
@@ -105,11 +120,24 @@ class PageRRMlaMetadata:
         self.slot_mapping = torch.empty(total_q, dtype=torch.int64, device=device)
         if total_q:
             _prepare_prefill_metadata[(triton.cdiv(total_q, 128),)](
-                padding, prefixes, table, self.slot_mapping, total_q, valid_tokens,
-                table.shape[1], table.stride(0), request_count=len(q_lens),
-                fixed_q_len=fixed_q_len, max_q_len=self.max_q, page_size=self.page_size,
-                kernel_page_size=self.kernel_page_size, cp_size=self.cp_size,
-                cp_rank=self.cp_rank, block=128, debug=True,
+                padding,
+                prefixes,
+                table,
+                self.slot_mapping,
+                total_q,
+                valid_tokens,
+                table.shape[1],
+                table.stride(0),
+                request_count=len(q_lens),
+                fixed_q_len=fixed_q_len,
+                max_q_len=self.max_q,
+                page_size=self.page_size,
+                kernel_page_size=self.kernel_page_size,
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank,
+                block=128,
+                table_replicated=self.table_replicated,
+                debug=True,
             )
         stream = torch.cuda.current_stream(device)
         for tensor in (lengths, prefixes, self.qo_indptr_d,
@@ -175,7 +203,11 @@ class PageRRMlaMetadata:
         rows = self.positions_d.numel()
         # A completely empty owner still needs a valid kernel table descriptor.
         # Its zero lengths prevent KV reads; no dummy page becomes a real key.
-        width = max(table.shape[1], 1)
+        width = table.shape[1]
+        if self.table_replicated:
+            subpages = self.page_size // self.kernel_page_size
+            width = triton.cdiv(width, self.cp_size * subpages) * subpages
+        width = max(width, 1)
         table_shape = (rows, width)
         if self.query_block_tables is None or self.query_block_tables.shape != table_shape:
             if forbid_realloc:
@@ -186,7 +218,11 @@ class PageRRMlaMetadata:
             base,
             # Main's sequence_lengths is a CPU mirror. The device length is
             # the graph-stable source for ordinary Decode capture and replay.
-            inputs.sequence_lengths_plus_1_device if inputs.is_cuda_graph and not multi else base,
+            (
+                inputs.sequence_lengths_plus_1_device
+                if inputs.is_cuda_graph and not multi
+                else base
+            ),
             cu_seqlens if mtp_update else base,
             valid_mask if valid_mask is not None else base,
             table,
@@ -197,6 +233,7 @@ class PageRRMlaMetadata:
             rows,
             table.shape[1],
             table.stride(0),
+            width,
             queries=queries,
             page_size=self.page_size,
             kernel_page_size=self.kernel_page_size,
@@ -209,4 +246,5 @@ class PageRRMlaMetadata:
             has_valid_mask=valid_mask is not None,
             block=128 if mtp_update else 32,
             table_block=128,
+            table_replicated=self.table_replicated,
         )

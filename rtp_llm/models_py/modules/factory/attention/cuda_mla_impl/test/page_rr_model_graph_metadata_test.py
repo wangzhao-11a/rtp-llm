@@ -136,7 +136,7 @@ class PageRRModelGraphMetadataTest(unittest.TestCase):
                             for tensor in outputs:
                                 tensor.fill_(-77)
                             with mock.patch.object(
-                                metadata, "prepare", wraps=metadata.prepare
+                                metadata, "prepare_decode", wraps=metadata.prepare_decode
                             ) as prepare:
                                 impl.prepare_cuda_graph(inputs)
                                 prepare.assert_not_called()

@@ -232,6 +232,7 @@ std::string ModelConfig::to_string() const {
         << "attn_config: {\n"
         << attn_config.DebugAttentionConfigStr() << "\n}\n"
         << "mla_ops_type: " << mlaOpsTypeToString(mla_ops_type) << "\n"
+        << "supports_native_kv_cache_sharding: " << supports_native_kv_cache_sharding << "\n"
         << "deepseek_rope_mscale: " << deepseek_rope_mscale << "\n"
         << "deepseek_mscale_all_dim: " << deepseek_mscale_all_dim << "\n"
         << "moe_n_group: " << moe_n_group << "\n"

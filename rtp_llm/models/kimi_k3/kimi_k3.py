@@ -220,6 +220,7 @@ class KimiK3(BaseModel):
         text_config: Dict[str, Any],
         config: KimiK3ModelConfig,
     ) -> None:
+        config.supports_native_kv_cache_sharding = True
         config.num_layers = int(cls._required(text_config, "num_hidden_layers"))
         config.hidden_size = int(cls._required(text_config, "hidden_size"))
         config.vocab_size = int(cls._required(text_config, "vocab_size"))

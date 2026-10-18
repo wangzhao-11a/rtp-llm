@@ -96,9 +96,14 @@ class KimiK3MlaImpl(MlaImplBase):
         self.kv_cache_type = attn_configs.kv_cache_dtype
         self.fp8_compute = attn_configs.mla_fp8_compute
         self.q_replicated = parallelism.role_type == RoleType.DECODE
+        # Prefill allocates only owner pages; Decode receives every FULL page.
+        self._page_rr_table_layout = "replicated" if self.q_replicated else "compact"
         self.page_rr_metadata = PageRRMlaMetadata(
-            int(self.attn_configs.tokens_per_block), int(self.token_per_block),
-            int(parallelism.tp_size), int(parallelism.tp_rank),
+            int(self.attn_configs.tokens_per_block),
+            int(self.token_per_block),
+            int(parallelism.tp_size),
+            int(parallelism.tp_rank),
+            table_layout=self._page_rr_table_layout,
         )
         if self._paged:
             self._init_paged(inputs)
@@ -124,6 +129,7 @@ class KimiK3MlaImpl(MlaImplBase):
             kernel_page_tokens=int(self.token_per_block),
             shard_size=int(parallelism.tp_size),
             shard_rank=int(parallelism.tp_rank),
+            table_layout=self._page_rr_table_layout,
         )
         self.prefill_wrapper = None
         if self.kv_cache_type == KvCacheDataType.FP8:

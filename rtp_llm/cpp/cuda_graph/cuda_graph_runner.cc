@@ -623,7 +623,6 @@ void CudaGraphRunner::prepareAttentionInputsImpl(const PyModelInputs& inputs,
     const int  selected_graph_batch_size =
         static_cast<int>(py_model_inputs_.attention_inputs.input_lengths_device.numel());
     const bool has_padded_rows            = state.current_batch_size < selected_graph_batch_size;
-    const bool has_fixed_width_dummy_rows = is_target_verify_ || usesFixedCapacityMtpDraftPrefillCudaGraph();
     const bool needs_host_metadata =
         !device_only_attention_metadata_ || isGenerationPrefillCudaGraph() || isEmbeddingStylePrefillCudaGraph();
 

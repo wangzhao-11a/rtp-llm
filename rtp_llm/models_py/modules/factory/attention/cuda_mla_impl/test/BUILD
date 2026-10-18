@@ -55,3 +55,15 @@ py_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
 )
+
+py_test(
+    name = "page_rr_table_layout_test",
+    srcs = ["page_rr_table_layout_test.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    target_compatible_with = select({
+        "//:using_cuda": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)

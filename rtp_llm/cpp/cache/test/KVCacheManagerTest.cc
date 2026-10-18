@@ -9,6 +9,8 @@
 #include <mutex>
 #include <optional>
 #include <algorithm>
+#include <array>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <thread>
@@ -360,6 +362,113 @@ makeDSV4CompleteTokenIds(int initial_seq_len, int max_seq_len, int seq_size_per_
     complete_token_ids->setSeqLength(initial_seq_len);
     return complete_token_ids;
 }
+
+struct PhysicalKVAllocationCase {
+    int    input_tokens;
+    size_t logical_pages;
+    size_t compact_pages;
+};
+
+constexpr std::array<PhysicalKVAllocationCase, 5> kPhysicalKVAllocationCases{{
+    {36864, 9, 2},
+    {40960, 10, 2},
+    {45056, 11, 2},
+    {49152, 12, 2},
+    {655360, 160, 20},
+}};
+
+static ModelConfig makePhysicalKVShardingModel(bool native_sharding) {
+    ModelConfig model;
+    model.num_layers                                      = 2;
+    model.max_seq_len                                     = 655360;
+    model.data_type                                       = DataType::TYPE_BF16;
+    model.supports_native_kv_cache_sharding               = native_sharding;
+    model.attn_config.head_num                            = 8;
+    model.attn_config.kv_head_num                         = 8;
+    model.attn_config.size_per_head                       = 1;
+    model.attn_config.tokens_per_block                    = 4096;
+    model.attn_config.kernel_tokens_per_block             = 128;
+    model.hybrid_attention_config.enable_hybrid_attention = true;
+    model.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::NONE, HybridAttentionType::LINEAR};
+    model.linear_attention_config.linear_num_key_heads    = 8;
+    model.linear_attention_config.linear_num_value_heads  = 8;
+    model.linear_attention_config.linear_key_head_dim     = 1;
+    model.linear_attention_config.linear_value_head_dim   = 1;
+    model.linear_attention_config.linear_conv_kernel_dim  = 2;
+    setHybridAttentionKvCacheSpecs(model);
+    return model;
+}
+
+static ParallelismConfig physicalKVParallelism(RoleType role, CPRotateMethod method, size_t tp_size = 8) {
+    ParallelismConfig parallelism;
+    parallelism.role_type                          = role;
+    parallelism.tp_size                            = tp_size;
+    parallelism.tp_rank                            = 0;
+    parallelism.prefill_cp_config.method           = method;
+    parallelism.prefill_cp_config.kv_cache_sharded = true;
+    return parallelism;
+}
+
+static CacheConfig makePhysicalKVShardingConfig(bool native_sharding, const ParallelismConfig& parallelism) {
+    KVCacheConfig options;
+    options.linear_step = 2;
+    return finalizeCacheConfig(
+        CacheConfigCreator::createConfig(makePhysicalKVShardingModel(native_sharding), parallelism, options), 192);
+}
+
+static void expectPhysicalKVAllocation(KVCacheManager& manager, const PhysicalKVAllocationCase& sample, bool compact) {
+    SCOPED_TRACE(sample.input_tokens);
+    const auto& config   = manager.cacheConfig();
+    auto        resource = makeDSV4BatchResource(config);
+    auto        tokens   = makeDSV4CompleteTokenIds(sample.input_tokens, sample.input_tokens, 4096);
+    MallocInfo  request{resource, tokens};
+    request.reuse_cache         = false;
+    request.enable_cache_lookup = false;
+    const auto free_before      = manager.freeBlocksNum();
+    ASSERT_TRUE(manager.malloc(request).success);
+
+    const auto& full = resource->blocks(0, "full");
+    EXPECT_EQ(full.size(), compact ? sample.compact_pages : sample.logical_pages);
+    EXPECT_TRUE(std::all_of(full.begin(), full.end(), [](int block) { return block > 0; }));
+    // LINEAR retains global timestep slots; with prefix reuse off only the
+    // final state is materialized. It must not inherit FULL page ownership.
+    const auto& linear = resource->blocks(0, "linear");
+    ASSERT_EQ(linear.size(), sample.logical_pages);
+    ASSERT_FALSE(linear.empty());
+    EXPECT_GT(linear.back(), 0);
+    EXPECT_EQ(std::count_if(linear.begin(), linear.end(), [](int block) { return block > 0; }), 1);
+    EXPECT_EQ(resource->cacheKeys(0).size(), sample.logical_pages);
+    if (compact) {
+        const auto mapper = manager.cpSlotMapper();
+        ASSERT_NE(mapper, nullptr);
+        EXPECT_EQ(mapper->localBlockCount(sample.input_tokens), sample.compact_pages);
+        EXPECT_EQ(mapper->effectiveSeqLenForAlloc(config, "linear", sample.input_tokens), sample.input_tokens);
+        EXPECT_EQ(mapper->logicalSeqSizePerBlock(config, "full"), 32768u);
+        EXPECT_EQ(mapper->logicalSeqSizePerBlock(config, "linear"), 4096u);
+        const auto canonical = mapper->canonicalCacheKeys(resource->cacheKeys(0));
+        ASSERT_EQ(canonical.size(), sample.logical_pages / 8);
+        for (size_t index = 0; index < canonical.size(); ++index) {
+            EXPECT_EQ(canonical[index], resource->cacheKeys(0)[(index + 1) * 8 - 1]);
+        }
+    }
+    manager.free(FreeInfo{resource, tokens});
+    EXPECT_EQ(manager.freeBlocksNum(), free_before);
+}
+
+static CacheConfig makeNativeSharedDraftConfig(const ParallelismConfig& parallelism, bool draft_native_sharding) {
+    auto target       = makePhysicalKVShardingModel(true);
+    target.num_layers = 1;
+    target.hybrid_attention_config.hybrid_attention_types = {HybridAttentionType::NONE};
+    setHybridAttentionKvCacheSpecs(target);
+    auto draft = target;
+    draft.supports_native_kv_cache_sharding = draft_native_sharding;
+    SpeculativeExecutionConfig speculative;
+    speculative.type              = SP_TYPE_MTP;
+    speculative.gen_num_per_cycle = 3;
+    return finalizeCacheConfig(
+        CacheConfigCreator::createConfig(target, parallelism, {}, speculative, &draft, true), 192);
+}
+
 
 static void writeDsv4RegionPattern(const std::shared_ptr<KVCacheManager>& manager,
                                    int                                    block_id,
@@ -2443,6 +2552,173 @@ TEST_F(KVCacheManagerTest, MaxAvailableTokensNumUsesCPVirtualBlockSizeForHybridP
     const auto info = kv_cache_manager->getKVCacheInfo(/*latest_version=*/-1, /*need_cache_keys=*/false);
     EXPECT_EQ(info.total_kv_cache, expected_logical_capacity);
     EXPECT_EQ(info.available_kv_cache, expected_logical_capacity);
+}
+
+TEST_F(KVCacheManagerTest, NativeKVShardingCapabilitySurvivesConfigCreation) {
+    EXPECT_FALSE(ModelConfig{}.supports_native_kv_cache_sharding);
+    for (const bool native_sharding : {false, true}) {
+        SCOPED_TRACE(native_sharding);
+        const auto model = makePhysicalKVShardingModel(native_sharding);
+        const auto parallelism = physicalKVParallelism(RoleType::PREFILL, CPRotateMethod::DISABLED);
+        const auto config = CacheConfigCreator::createConfig(model, parallelism, {});
+        const auto warmup = CacheConfigCreator::createWarmupConfig(model, parallelism);
+        const auto warmup_with_options = CacheConfigCreator::createWarmupConfig(model, parallelism, KVCacheConfig{});
+        EXPECT_EQ(config.supports_native_kv_cache_sharding, native_sharding);
+        EXPECT_EQ(warmup.supports_native_kv_cache_sharding, native_sharding);
+        EXPECT_EQ(warmup_with_options.supports_native_kv_cache_sharding, native_sharding);
+    }
+}
+
+TEST_F(KVCacheManagerTest, NativeKVShardingPrefillWithoutQueryCPAllocatesCompactFullPages) {
+    for (size_t rank = 0; rank < 8; ++rank) {
+        SCOPED_TRACE(rank);
+        auto parallelism = physicalKVParallelism(RoleType::PREFILL, CPRotateMethod::DISABLED);
+        parallelism.tp_rank = rank;
+        const auto config = makePhysicalKVShardingConfig(true, parallelism);
+        KVCacheManager manager(config, false, nullptr, {}, parallelism);
+        const auto mapper = manager.cpSlotMapper();
+        ASSERT_NE(mapper, nullptr);
+        EXPECT_EQ(mapper->cpRank(), static_cast<int>(rank));
+        EXPECT_EQ(mapper->cpSize(), 8);
+        EXPECT_TRUE(mapper->blockRoundRobinGroup(config, "full"));
+        EXPECT_FALSE(mapper->blockRoundRobinGroup(config, "linear"));
+        EXPECT_FALSE(mapper->compactLastRankGroup(config, "linear"));
+        // TP0 performs allocations; followers receive its compact table.
+        if (rank == 0) {
+            ASSERT_TRUE(manager.init());
+            for (const auto& sample : kPhysicalKVAllocationCases) {
+                expectPhysicalKVAllocation(manager, sample, true);
+            }
+        }
+    }
+}
+
+TEST_F(KVCacheManagerTest, QueryCPDisabledWithoutNativeCapabilityKeepsFullTables) {
+    const auto parallelism = physicalKVParallelism(RoleType::PREFILL, CPRotateMethod::DISABLED);
+    const auto config = makePhysicalKVShardingConfig(false, parallelism);
+    KVCacheManager manager(config, false, nullptr, {}, parallelism);
+    EXPECT_EQ(manager.cpSlotMapper(), nullptr);
+    ASSERT_TRUE(manager.init());
+    for (const auto& sample : kPhysicalKVAllocationCases) {
+        expectPhysicalKVAllocation(manager, sample, false);
+    }
+}
+
+TEST_F(KVCacheManagerTest, QueryCPEnabledKeepsExistingPhysicalKVSharding) {
+    for (const auto method :
+         {CPRotateMethod::ALL_GATHER, CPRotateMethod::ALL_GATHER_WITH_OVERLAP, CPRotateMethod::ALLTOALL}) {
+        SCOPED_TRACE(static_cast<int>(method));
+        const auto parallelism = physicalKVParallelism(RoleType::PREFILL, method);
+        const auto config = makePhysicalKVShardingConfig(false, parallelism);
+        KVCacheManager manager(config, false, nullptr, {}, parallelism);
+        ASSERT_NE(manager.cpSlotMapper(), nullptr);
+        ASSERT_TRUE(manager.init());
+        expectPhysicalKVAllocation(manager, kPhysicalKVAllocationCases.front(), true);
+        expectPhysicalKVAllocation(manager, kPhysicalKVAllocationCases.back(), true);
+    }
+}
+
+TEST_F(KVCacheManagerTest, DecodeAlwaysAllocatesFullTablesRegardlessOfQueryCPOrNativeCapability) {
+    for (const bool native_sharding : {false, true}) {
+        for (const auto method : {CPRotateMethod::DISABLED, CPRotateMethod::ALL_GATHER,
+                                  CPRotateMethod::ALL_GATHER_WITH_OVERLAP, CPRotateMethod::ALLTOALL,
+                                  CPRotateMethod::PREFILL_CP, CPRotateMethod::UNKNOWN}) {
+            SCOPED_TRACE(native_sharding);
+            SCOPED_TRACE(static_cast<int>(method));
+            const auto parallelism = physicalKVParallelism(RoleType::DECODE, method);
+            const auto config = makePhysicalKVShardingConfig(native_sharding, parallelism);
+            PDSepConfig pd;
+            pd.role_type = RoleType::DECODE;
+            KVCacheManager manager(config, false, nullptr, {}, parallelism, {}, {}, pd);
+            EXPECT_EQ(manager.cpSlotMapper(), nullptr);
+            ASSERT_TRUE(manager.init());
+            expectPhysicalKVAllocation(manager, kPhysicalKVAllocationCases.front(), false);
+            expectPhysicalKVAllocation(manager, kPhysicalKVAllocationCases.back(), false);
+        }
+    }
+}
+
+TEST_F(KVCacheManagerTest, NativeKVShardingStillRequiresFlagAndMultipleRanks) {
+    for (const bool native_sharding : {false, true}) {
+        for (const auto method : {CPRotateMethod::DISABLED, CPRotateMethod::ALL_GATHER}) {
+            for (const bool single_rank : {false, true}) {
+                SCOPED_TRACE(native_sharding);
+                SCOPED_TRACE(static_cast<int>(method));
+                SCOPED_TRACE(single_rank);
+                auto parallelism = physicalKVParallelism(RoleType::PREFILL, method, single_rank ? 1 : 8);
+                parallelism.prefill_cp_config.kv_cache_sharded = single_rank;
+                const auto config = makePhysicalKVShardingConfig(native_sharding, parallelism);
+                KVCacheManager manager(config, false, nullptr, {}, parallelism);
+                EXPECT_EQ(manager.cpSlotMapper(), nullptr);
+                ASSERT_TRUE(manager.init());
+                expectPhysicalKVAllocation(manager, kPhysicalKVAllocationCases[1], false);
+            }
+        }
+    }
+}
+
+TEST_F(KVCacheManagerTest, NativeKVShardingRequiresCompatibleDraftsSharingTheCompactTable) {
+    const auto parallelism = physicalKVParallelism(RoleType::PREFILL, CPRotateMethod::DISABLED);
+    for (const bool draft_native_sharding : {false, true}) {
+        SCOPED_TRACE(draft_native_sharding);
+        const auto config = makeNativeSharedDraftConfig(parallelism, draft_native_sharding);
+        ASSERT_FALSE(config.mtp_sub_configs.empty());
+        for (const auto& draft : config.mtp_sub_configs) {
+            ASSERT_NE(draft, nullptr);
+            EXPECT_EQ(draft->supports_native_kv_cache_sharding, draft_native_sharding);
+        }
+        if (!draft_native_sharding) {
+            try {
+                KVCacheManager manager(config, false, nullptr, {}, parallelism);
+                FAIL() << "incompatible native draft was accepted";
+            } catch (const std::runtime_error& error) {
+                EXPECT_NE(std::string(error.what()).find("every draft sharing the compact table"), std::string::npos);
+            }
+        } else {
+            KVCacheManager manager(config, false, nullptr, {}, parallelism);
+            ASSERT_NE(manager.cpSlotMapper(), nullptr);
+            ASSERT_TRUE(manager.init());
+            auto resource = makeDSV4BatchResource(config);
+            auto tokens = makeDSV4CompleteTokenIds(40960, 40960, 4096);
+            MallocInfo request{resource, tokens};
+            request.reuse_cache = false;
+            request.enable_cache_lookup = false;
+            ASSERT_TRUE(manager.malloc(request).success);
+            EXPECT_EQ(resource->blocksNum(0, "full"), 2);
+            manager.free(FreeInfo{resource, tokens});
+        }
+    }
+}
+
+TEST_F(KVCacheManagerTest, NativeDraftCapabilityCheckDoesNotRestrictLegacyQueryCPOrDecode) {
+    for (const auto role : {RoleType::PREFILL, RoleType::DECODE}) {
+        for (const auto method : {CPRotateMethod::DISABLED, CPRotateMethod::ALL_GATHER,
+                                  CPRotateMethod::ALL_GATHER_WITH_OVERLAP, CPRotateMethod::ALLTOALL,
+                                  CPRotateMethod::PREFILL_CP, CPRotateMethod::UNKNOWN}) {
+            if (role == RoleType::PREFILL
+                && (method == CPRotateMethod::DISABLED || method == CPRotateMethod::PREFILL_CP
+                    || method == CPRotateMethod::UNKNOWN)) {
+                continue;
+            }
+            SCOPED_TRACE(static_cast<int>(role));
+            SCOPED_TRACE(static_cast<int>(method));
+            const auto parallelism = physicalKVParallelism(role, method);
+            const auto config = makeNativeSharedDraftConfig(parallelism, false);
+            PDSepConfig pd;
+            pd.role_type = role;
+            KVCacheManager manager(config, false, nullptr, {}, parallelism, {}, {}, pd);
+            EXPECT_EQ(manager.cpSlotMapper() != nullptr, role == RoleType::PREFILL);
+            ASSERT_TRUE(manager.init());
+            auto resource = makeDSV4BatchResource(config);
+            auto tokens = makeDSV4CompleteTokenIds(40960, 40960, 4096);
+            MallocInfo request{resource, tokens};
+            request.reuse_cache = false;
+            request.enable_cache_lookup = false;
+            ASSERT_TRUE(manager.malloc(request).success);
+            EXPECT_EQ(resource->blocksNum(0, "full"), role == RoleType::PREFILL ? 2 : 10);
+            manager.free(FreeInfo{resource, tokens});
+        }
+    }
 }
 
 TEST_F(KVCacheManagerTest, GetKVCacheInfo_IncludesMemoryBlocksInTotalAndAvailable) {

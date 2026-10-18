@@ -507,6 +507,7 @@ std::string CacheConfig::debugString(size_t indent) const {
     OUTPUT_FIELD(layer_num);
     OUTPUT_FIELD_EXPR("layer_all_num", layer_all_num());
     OUTPUT_FIELD_EXPR("use_mla", (use_mla ? "true" : "false"));
+    OUTPUT_FIELD_EXPR("supports_native_kv_cache_sharding", (supports_native_kv_cache_sharding ? "true" : "false"));
     os << "\n";
 
     os << indent1 << "# Block Configuration:\n";

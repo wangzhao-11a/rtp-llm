@@ -2075,6 +2075,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("cache_min_replay_tokens", &ModelConfig::cache_min_replay_tokens)
         .def_readwrite("cache_key_hash_seed", &ModelConfig::cache_key_hash_seed)
         .def_readwrite("kv_cache_spec_descs", &ModelConfig::kv_cache_spec_descs)
+        .def_readwrite("supports_native_kv_cache_sharding", &ModelConfig::supports_native_kv_cache_sharding)
         // task_type is defined as property below
         .def_readwrite("ckpt_path", &ModelConfig::ckpt_path)
         .def_readwrite("tokenizer_path", &ModelConfig::tokenizer_path)

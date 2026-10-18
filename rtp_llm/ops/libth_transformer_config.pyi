@@ -1100,6 +1100,7 @@ class ModelConfig:
     embedding_size: int
     eplb_config: EPLBConfig
     kv_cache_spec_descs: list[list[KVCacheSpecDesc]]
+    supports_native_kv_cache_sharding: bool
     cache_min_replay_tokens: int
     cache_key_hash_seed: int
     expert_num: int

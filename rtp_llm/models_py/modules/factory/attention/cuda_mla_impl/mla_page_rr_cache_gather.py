@@ -166,6 +166,7 @@ def _pack_mla_page_rr_prefix(
     local_block_table: torch.Tensor,
     descriptor: MlaPageRRChunkDescriptor,
     shard_rank: int,
+    table_layout: str = "compact",
 ) -> torch.Tensor:
     page_tokens = descriptor.page_tokens
     if not isinstance(local_block_table, torch.Tensor) or local_block_table.dim() != 2:
@@ -201,7 +202,14 @@ def _pack_mla_page_rr_prefix(
     from rtp_llm.models_py.triton_kernels.mla.page_rr import pack_prefix_cuda
 
     payload = raw_cache.new_empty(output_shape)
-    pack_prefix_cuda(raw_cache, local_block_table, descriptor, shard_rank, payload)
+    pack_prefix_cuda(
+        raw_cache,
+        local_block_table,
+        descriptor,
+        shard_rank,
+        payload,
+        table_replicated=table_layout == "replicated",
+    )
     return payload
 
 
@@ -228,11 +236,14 @@ class MlaPageRRCacheGather:
     shard_size: int
     shard_rank: int
     kernel_page_tokens: Optional[int] = None
+    table_layout: str = "compact"
     _prefix_descriptor: Optional[MlaPageRRChunkDescriptor] = field(
         default=None, init=False, repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
+        if self.table_layout not in ("compact", "replicated"):
+            raise ValueError("Page-RR table_layout must be compact or replicated")
         kernel_page_tokens = _validate_geometry(
             self.page_tokens, self.shard_size, self.shard_rank, self.kernel_page_tokens
         )
@@ -308,6 +319,7 @@ class MlaPageRRCacheGather:
             local_block_table,
             descriptor,
             self.shard_rank,
+            self.table_layout,
         )
 
     def _pack_prefix(
@@ -334,7 +346,7 @@ class MlaPageRRCacheGather:
             )
             object.__setattr__(self, "_prefix_descriptor", descriptor)
         return _pack_mla_page_rr_prefix(
-            raw_cache, local_block_table, descriptor, self.shard_rank
+            raw_cache, local_block_table, descriptor, self.shard_rank, self.table_layout
         )
 
 

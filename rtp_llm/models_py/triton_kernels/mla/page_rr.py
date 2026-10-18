@@ -90,6 +90,7 @@ def _pack_prefix_kernel(
     TABLE_WIDTH: tl.constexpr,
     TABLE_REQUEST_STRIDE: tl.constexpr,
     TABLE_PAGE_STRIDE: tl.constexpr,
+    TABLE_REPLICATED: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     packed_page = tl.program_id(0).to(tl.int64)
@@ -117,7 +118,7 @@ def _pack_prefix_kernel(
         & (token < PAGE_TOKENS)
         & (relative_page * PAGE_TOKENS + token < prefix_len)
     )
-    owner_local_page = global_page // SHARDS
+    owner_local_page = global_page if TABLE_REPLICATED else global_page // SHARDS
     kernel_page = (
         owner_local_page * (PAGE_TOKENS // KERNEL_PAGE_TOKENS)
         + token // KERNEL_PAGE_TOKENS
@@ -189,7 +190,7 @@ def _restore_prefix_kernel(
     tl.store(Output + output_start + elements, values, mask=live)
 
 
-def pack_prefix_cuda(cache, table, descriptor, rank, output):
+def pack_prefix_cuda(cache, table, descriptor, rank, output, table_replicated=False):
     with torch.cuda.device(cache.device):
         metadata = _metadata(descriptor, cache.device)
         features = descriptor.feature_width
@@ -216,6 +217,7 @@ def pack_prefix_cuda(cache, table, descriptor, rank, output):
             table.shape[1],
             table.stride(0),
             table.stride(1),
+            table_replicated,
             _BLOCK_ELEMENTS,
             num_warps=4,
             debug=True,
@@ -241,15 +243,24 @@ def restore_prefix_cuda(gathered, descriptor, output):
 
 @triton.jit
 def _page_rr_cache_slot(
-    position, batch, active, table, table_width, table_stride,
-    page_size: tl.constexpr, kernel_page_size: tl.constexpr,
-    cp_size: tl.constexpr, cp_rank: tl.constexpr,
+    position,
+    batch,
+    active,
+    table,
+    table_width,
+    table_stride,
+    page_size: tl.constexpr,
+    kernel_page_size: tl.constexpr,
+    cp_size: tl.constexpr,
+    cp_rank: tl.constexpr,
     check_owner: tl.constexpr = False,
+    table_replicated: tl.constexpr = False,
 ):
     # Ownership uses physical pages; tables and cache writers use kernel subpages.
     global_page = position // page_size
     offset = position % page_size
-    local_page = global_page // cp_size * (page_size // kernel_page_size)
+    table_page = global_page if table_replicated else global_page // cp_size
+    local_page = table_page * (page_size // kernel_page_size)
     local_page += offset // kernel_page_size
     owner = active & (position >= 0) & (global_page % cp_size == cp_rank)
     in_table = (local_page >= 0) & (local_page < table_width)
@@ -267,11 +278,23 @@ def _page_rr_cache_slot(
 
 @triton.jit
 def _prepare_prefill_metadata(
-    padding_offset, prefix_lengths, table, slots, tokens, valid_tokens,
-    table_width, table_stride,
-    request_count: tl.constexpr, fixed_q_len: tl.constexpr, max_q_len: tl.constexpr,
-    page_size: tl.constexpr, kernel_page_size: tl.constexpr,
-    cp_size: tl.constexpr, cp_rank: tl.constexpr, block: tl.constexpr,
+    padding_offset,
+    prefix_lengths,
+    table,
+    slots,
+    tokens,
+    valid_tokens,
+    table_width,
+    table_stride,
+    request_count: tl.constexpr,
+    fixed_q_len: tl.constexpr,
+    max_q_len: tl.constexpr,
+    page_size: tl.constexpr,
+    kernel_page_size: tl.constexpr,
+    cp_size: tl.constexpr,
+    cp_rank: tl.constexpr,
+    block: tl.constexpr,
+    table_replicated: tl.constexpr = False,
 ):
     row = tl.program_id(0) * block + tl.arange(0, block)
     valid = row < tokens
@@ -288,8 +311,18 @@ def _prepare_prefill_metadata(
     tl.device_assert((~active) | in_batch, "batch index out of range")
     position = tl.load(prefix_lengths + batch, valid & in_batch, other=0) + offset
     slot = _page_rr_cache_slot(
-        position, batch, active & in_batch, table, table_width, table_stride,
-        page_size, kernel_page_size, cp_size, cp_rank, check_owner=True,
+        position,
+        batch,
+        active & in_batch,
+        table,
+        table_width,
+        table_stride,
+        page_size,
+        kernel_page_size,
+        cp_size,
+        cp_rank,
+        check_owner=True,
+        table_replicated=table_replicated,
     )
     tl.store(slots + row, slot, valid)
 
@@ -308,6 +341,7 @@ def _prepare_decode_metadata(
     rows,
     table_width,
     table_stride,
+    query_table_width: tl.constexpr,
     queries: tl.constexpr,
     page_size: tl.constexpr,
     kernel_page_size: tl.constexpr,
@@ -320,7 +354,9 @@ def _prepare_decode_metadata(
     has_valid_mask: tl.constexpr,
     block: tl.constexpr,
     table_block: tl.constexpr = 128,
+    table_replicated: tl.constexpr = False,
 ):
+    subpages: tl.constexpr = page_size // kernel_page_size
     if mtp_update:
         # One program prepares a physical query and its complete page table.
         # Request boundaries remain device data, including zero-length slots.
@@ -338,14 +374,23 @@ def _prepare_decode_metadata(
         batch = row // queries
         query_offset = row % queries
         column = tl.program_id(1) * table_block + tl.arange(0, table_block)
+        if table_replicated:
+            source_column = (
+                column // subpages * cp_size + cp_rank
+            ) * subpages + column % subpages
+        else:
+            source_column = column
         page = tl.load(
-            table + batch[:, None] * table_stride + column[None, :],
-            valid[:, None] & (column[None, :] < table_width), other=0,
+            table + batch[:, None] * table_stride + source_column[None, :],
+            valid[:, None]
+            & (column[None, :] < query_table_width)
+            & (source_column[None, :] < table_width),
+            other=0,
         )
-        width = tl.maximum(table_width, 1)
         tl.store(
-            query_tables + row[:, None] * width + column[None, :], page,
-            valid[:, None] & (column[None, :] < width),
+            query_tables + row[:, None] * query_table_width + column[None, :],
+            page,
+            valid[:, None] & (column[None, :] < query_table_width),
         )
         # Other column tiles only copy their disjoint part of the page table.
         valid = valid & (tl.program_id(1) == 0)
@@ -370,14 +415,36 @@ def _prepare_decode_metadata(
     tl.store(local_lengths + row, tl.where(active, length, 0), valid)
 
     slot = _page_rr_cache_slot(
-        position, batch, active, table, table_width, table_stride,
-        page_size, kernel_page_size, cp_size, cp_rank,
+        position,
+        batch,
+        active,
+        table,
+        table_width,
+        table_stride,
+        page_size,
+        kernel_page_size,
+        cp_size,
+        cp_rank,
+        table_replicated=table_replicated,
     )
     tl.store(slots + row, slot, valid)
 
     if mtp_update:
-        width = tl.maximum(table_width, 1)
-        for start in range(0, width, block):
+        for start in range(0, query_table_width, block):
             column = start + tl.arange(0, block)
-            page = tl.load(table + batch * table_stride + column, active & (column < table_width), other=0)
-            tl.store(query_tables + row * width + column, page, column < width)
+            if table_replicated:
+                source_column = (
+                    column // subpages * cp_size + cp_rank
+                ) * subpages + column % subpages
+            else:
+                source_column = column
+            page = tl.load(
+                table + batch * table_stride + source_column,
+                active & (column < query_table_width) & (source_column < table_width),
+                other=0,
+            )
+            tl.store(
+                query_tables + row * query_table_width + column,
+                page,
+                column < query_table_width,
+            )

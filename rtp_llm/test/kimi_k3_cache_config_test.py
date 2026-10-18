@@ -81,6 +81,14 @@ class KimiK3MtpMediaTokenConfigTest(unittest.TestCase):
             },
         }
 
+    def test_target_and_draft_declare_native_kv_sharding(self):
+        draft = KimiK3Mtp._from_config_json(self._checkpoint_config())
+        checkpoint = self._checkpoint_config()
+        checkpoint["text_config"]["linear_attn_config"]["full_attn_layers"] = [4]
+        target = KimiK3._from_config_json(checkpoint)
+        self.assertTrue(target.supports_native_kv_cache_sharding)
+        self.assertTrue(draft.supports_native_kv_cache_sharding)
+
     def test_media_token_is_retained_without_configuring_vit(self):
         for media_token_id in (0, 17, 127):
             with self.subTest(media_token_id=media_token_id):

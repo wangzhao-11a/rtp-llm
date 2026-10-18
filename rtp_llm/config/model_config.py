@@ -133,6 +133,7 @@ class ModelConfig(CppModelConfig):
         "position_ids_style",
         "pre_seq_len",
         "use_kvcache",
+        "supports_native_kv_cache_sharding",
         "logit_scale",
         "qk_norm",
         "expert_num",

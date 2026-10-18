@@ -27,6 +27,29 @@ cuda_deps = [
     "@local_config_cuda//cuda:cudart",
 ]
 
+# The attention-residual kernel uses Blackwell TMEM instructions. Keep its
+# architecture and math flags local to this translation unit.
+cc_library(
+    name = "kimi_k3_attn_res",
+    srcs = ["kimi_k3_attn_res.cu"],
+    hdrs = ["kimi_k3_attn_res.h"],
+    deps = torch_deps() + [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ],
+    copts = copts() + cuda_default_copts_without_arch() + [
+        "-O3",
+        "-nvcc_options=use_fast_math",
+        "-nvcc_options=extended-lambda",
+        "--cuda-gpu-arch=sm_100f",
+    ],
+    target_compatible_with = select({
+        "@//:using_cuda13_x86": [],
+        "@//:using_cuda13_arm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
 cc_library(
     name = "cuda_utils_common",
     hdrs = [
@@ -394,5 +417,29 @@ cc_library(
     ] + torch_deps(),
     # Preserve ATen's FP32 argmax order for subnormal values.
     copts = cuda_copts() + ["-nvcc_options=ftz=false"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "custom_all_gather",
+    srcs = ["custom_all_gather.cu"],
+    hdrs = ["custom_all_gather.h"],
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ] + torch_deps(),
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "push_reduce_scatter",
+    srcs = ["push_reduce_scatter.cu"],
+    hdrs = ["push_reduce_scatter.h"],
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ] + torch_deps(),
+    copts = cuda_copts(),
     visibility = ["//visibility:public"],
 )

@@ -298,10 +298,11 @@ CacheConfig createConfigFromDescs(const ModelConfig&       model_config,
         CacheConfigCreator::buildLayerSpecsFromDescs(model_config.kv_cache_spec_descs, ctx, model_config.num_layers);
 
     CacheConfig config;
-    config.dtype                   = ctx.dtype;
-    config.layer_num               = static_cast<uint32_t>(model_config.num_layers);
-    config.cache_min_replay_tokens = std::max(1, model_config.cache_min_replay_tokens);
-    config.cache_key_hash_seed     = model_config.cache_key_hash_seed;
+    config.dtype                             = ctx.dtype;
+    config.layer_num                         = static_cast<uint32_t>(model_config.num_layers);
+    config.cache_min_replay_tokens           = std::max(1, model_config.cache_min_replay_tokens);
+    config.cache_key_hash_seed               = model_config.cache_key_hash_seed;
+    config.supports_native_kv_cache_sharding = model_config.supports_native_kv_cache_sharding;
 
     config.seq_size_per_block = seq_size;
     config.use_mla            = model_config.attn_config.use_mla;
