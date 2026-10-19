@@ -2634,7 +2634,8 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
                 }
                 ++samples;
                 EXPECT_EQ(record->Tags()->FindTag("dp_rank"), "0");
-                EXPECT_EQ(record->Tags()->FindTag("pp_rank"), "");
+                // First stage reports its own executor metrics tagged pp_rank=0.
+                EXPECT_EQ(record->Tags()->FindTag("pp_rank"), "0");
                 kmonitor::MinMaxCalculator expected;
                 expected.Add(duration);
                 EXPECT_EQ(value->Value(), expected.ToString());

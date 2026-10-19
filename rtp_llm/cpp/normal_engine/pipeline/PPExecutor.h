@@ -211,6 +211,10 @@ private:
                              const StreamGroups::TokenCountsByPriority& token_counts_by_priority,
                              RtpLLMSpeculativeEngineMetricsCollector&   sp_collector);
 
+    /* Report this stage's local executor timings tagged with pp_rank. Called by non-first
+       stages at round end; the first stage reports through reportResultMetrics. */
+    void reportStageMetrics(RtpLLMExecutorMetricsCollector& collector);
+
 private:
     const bool                              warm_up_;
     const RoleType                          role_type_;

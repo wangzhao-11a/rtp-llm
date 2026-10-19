@@ -1255,6 +1255,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
     auto                           tps_active_guard      = tps_reporter_.makeActiveGuard(report_active);
     auto                           wall_tps_active_guard = wall_tps_reporter_.makeActiveGuard(report_active);
     RtpLLMExecutorMetricsCollector executor_collector;
+    executor_collector.pp_rank = parallelism_config_.pp_rank;
 
     /** 0. Admit compatible streams and prepare SP buffers. */
     auto streams = schedule_output.streams;
@@ -1276,7 +1277,9 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         executor_collector.gather_model_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         plan_payload                             = pp_serialization::serializePlan(plan, !isStageRoot());
     } else {
-        plan = receivePlan(plan_payload);
+        const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        plan                     = receivePlan(plan_payload);
+        executor_collector.plan_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
     if (isLastStage() && isStageRoot()) {
@@ -1302,9 +1305,11 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
     auto& inflight = slots_[current_slot_];
     {
         RTP_LLM_PROFILE_SCOPE("executor.pp.wait_slot_reuse");
+        const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         waitAll(inflight.plan_sends);
         waitAll(inflight.activation_sends);
         waitAll(inflight.execution_result_sends);
+        executor_collector.slot_reuse_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
     inflight.reset();
     if (isFirstStage() && isStageRoot()) {
@@ -1332,9 +1337,15 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
 
         PPIntermediateTensors input_tensors;
         if (!isFirstStage()) {
-            input_tensors = receiveTensors();
+            const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+            input_tensors            = receiveTensors();
+            executor_collector.activation_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         }
-        waitLastRun();
+        {
+            const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+            waitLastRun();
+            executor_collector.last_run_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        }
         releaseAllModelBuffers();
 
         if (cache_manager_) {
@@ -1389,7 +1400,9 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
 
         if (!isLastStage()) {
             PPIntermediateTensors output_tensors{std::move(model_output.pp_intermediates)};
+            const auto            start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
             asyncSendTensors(output_tensors, inflight.activation_sends);
+            executor_collector.send_activation_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         } else {
             PPExecutionResult execution_result;
             if (isStageRoot()) {
@@ -1426,12 +1439,16 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
                         eraseFailedDSparkQ(execution_result);
                     }
                 }
+                const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
                 asyncSendExecutionResult(execution_result, inflight.execution_result_sends);
+                executor_collector.send_result_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
             }
         }
         last_compute_done_.record(cuda_graph::graphGetCurrentStream());
         if (isFirstStage() && isStageRoot()) {
             inflight.executor_collector = executor_collector;
+        } else if (isStageRoot()) {
+            reportStageMetrics(executor_collector);
         }
         if (profile_step_finish_) {
             profile_step_finish_();
@@ -1535,9 +1552,8 @@ void PPExecutor::reportResultMetrics(InflightBatch&                             
         return;
     }
 
-    /** Executor timings cover first-stage local work, returned last-stage sampling and result dispatch.
-     * TODO: Add stage-local forward (including tail draft), TP sync, EPLB and grammar metrics in a
-     * separate change. Keep legacy metrics on the first stage without cross-stage aggregation. */
+    /** First-stage executor timings tagged pp_rank=0; other stages report their own via reportStageMetrics.
+     * This deferred report also carries the result-time dispatch and the returned last-stage sampling. */
     metrics_reporter_->report<RtpLLMExecutorMetrics, RtpLLMExecutorMetricsCollector>(nullptr,
                                                                                      &batch.executor_collector);
 
@@ -1563,6 +1579,13 @@ void PPExecutor::reportResultMetrics(InflightBatch&                             
         metrics_reporter_->report<RtpLLMSpeculativeEngineMetrics, RtpLLMSpeculativeEngineMetricsCollector>(
             nullptr, &sp_collector);
     }
+}
+
+void PPExecutor::reportStageMetrics(RtpLLMExecutorMetricsCollector& collector) {
+    if (!metrics_reporter_ || warm_up_ || !isStageRoot()) {
+        return;
+    }
+    metrics_reporter_->report<RtpLLMExecutorMetrics, RtpLLMExecutorMetricsCollector>(nullptr, &collector);
 }
 
 }  // namespace rtp_llm
