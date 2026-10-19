@@ -5,6 +5,8 @@ from smoke.base_comparer import _asserts_cold_cache
 from smoke.common_def import QueryStatus, SmokeException, Tracer
 from smoke.normal_comparer import NormalComparer, QueryInfo
 
+from rtp_llm.config.generate_config import GenerateConfig
+
 GRAPH_STATUS = "generation_prefill_cuda_graph_status"
 REPLAYED = "replayed"
 FALLBACK = "input_tokens_exceed_capture_limit"
@@ -221,6 +223,47 @@ class NormalComparerDiskReuseTest(unittest.TestCase):
                         }
                     )
                 )
+
+
+class NormalComparerStreamCloseTest(unittest.TestCase):
+    def setUp(self):
+        self.comparer = NormalComparer(None, "", {}, Tracer(), False)
+
+    def _query(self, incremental=False):
+        return QueryInfo(
+            prompt="hi",
+            yield_generator=True,
+            generate_config=GenerateConfig(return_incremental=incremental),
+        )
+
+    def test_single_error_payload_is_reported_not_indexed(self):
+        payload = b'data:{"error_code": 8205, "message": "Socket closed"}'
+        with self.assertRaises(SmokeException) as raised:
+            self.comparer.curl_response_to_json(self._query(), [payload])
+        self.assertEqual(raised.exception.error_status, QueryStatus.VISIT_FAILED)
+        self.assertIn("8205", raised.exception.message)
+
+    def test_empty_stream_reports_visit_failed(self):
+        with self.assertRaises(SmokeException) as raised:
+            self.comparer.curl_response_to_json(self._query(), [])
+        self.assertEqual(raised.exception.error_status, QueryStatus.VISIT_FAILED)
+        self.assertIn("<empty>", raised.exception.message)
+
+    def test_incremental_short_stream_reports_visit_failed(self):
+        payload = b'data:{"response": "a", "finished": false}'
+        with self.assertRaises(SmokeException) as raised:
+            self.comparer.curl_response_to_json(
+                self._query(incremental=True), [payload]
+            )
+        self.assertEqual(raised.exception.error_status, QueryStatus.VISIT_FAILED)
+
+    def test_healthy_stream_still_parses(self):
+        payload = b'data:{"response": "hello", "finished": true}'
+        terminator = b"data:[DONE]"
+        parsed = self.comparer.curl_response_to_json(
+            self._query(), [payload, terminator]
+        )
+        self.assertEqual(parsed["response"], "hello")
 
 
 if __name__ == "__main__":
