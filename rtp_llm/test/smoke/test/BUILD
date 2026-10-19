@@ -27,3 +27,21 @@ py_test(
     legacy_create_init = 0,
     deps = SMOKE_FRAMEWORK_DEPS,
 )
+
+py_test(
+    name = "dash_sc_grpc_comparer_test",
+    srcs = ["dash_sc_grpc_comparer_test.py"],
+    data = ["//rtp_llm/test/smoke:smoke_framework_srcs"],
+    imports = ["../.."],
+    legacy_create_init = 0,
+    deps = SMOKE_FRAMEWORK_DEPS,
+)
+
+py_test(
+    name = "dash_grpc_comparer_test",
+    srcs = ["dash_grpc_comparer_test.py"],
+    data = ["//rtp_llm/test/smoke:smoke_framework_srcs"],
+    imports = ["../.."],
+    legacy_create_init = 0,
+    deps = SMOKE_FRAMEWORK_DEPS,
+)
