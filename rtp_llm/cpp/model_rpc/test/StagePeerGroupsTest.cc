@@ -232,4 +232,17 @@ TEST(StagePeerGroups, GroupLoadEmptyPeerGroupRejected) {
     EXPECT_FALSE(plan.error.empty());
 }
 
+TEST(StagePeerGroups, GroupLoadRejectsUnsupportedTpRatio) {
+    const auto plan = planStageGroupLoads(makeGroupParams(3, 1, false, 2, 0));
+    EXPECT_TRUE(plan.loads.empty());
+    EXPECT_NE(plan.error.find("unsupported TP ratio"), std::string::npos);
+}
+
+TEST(StagePeerGroups, GroupLoadMlaBypassesTpRatioCheck) {
+    const auto plan = planStageGroupLoads(makeGroupParams(3, 1, false, 2, 1, /*use_mla=*/true));
+    EXPECT_TRUE(plan.error.empty());
+    ASSERT_EQ(plan.loads.size(), 1u);
+    EXPECT_EQ(plan.loads[0].peer_index, 1u);
+}
+
 }  // namespace rtp_llm

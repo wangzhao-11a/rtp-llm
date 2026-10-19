@@ -7,6 +7,15 @@
 
 namespace rtp_llm {
 
+namespace {
+
+/** Head-sliced KV mapping needs one TP size to divide the other. */
+bool isCompatibleTpRatio(int prefill_tp, int decode_tp) {
+    return prefill_tp % decode_tp == 0 || decode_tp % prefill_tp == 0;
+}
+
+}  // namespace
+
 std::vector<StagePeerGroup> buildStagePeerGroups(const ParallelismConfig&        parallelism_config,
                                                  const std::vector<std::string>& workers) {
     const int64_t pp_size = std::max<int64_t>(1, parallelism_config.pp_size);
@@ -52,7 +61,7 @@ std::vector<StagePeerSlice> planStagePeerSlices(int prefill_tp, int decode_tp, i
         /** Every lane owns the full block: one whole-block peer per stage suffices. */
         return {{static_cast<size_t>(decode_tp_rank % prefill_tp), 1, 0, 1, 0}};
     }
-    RTP_LLM_CHECK_WITH_INFO(prefill_tp % decode_tp == 0 || decode_tp % prefill_tp == 0,
+    RTP_LLM_CHECK_WITH_INFO(isCompatibleTpRatio(prefill_tp, decode_tp),
                             "unsupported TP ratio prefill=%d decode=%d",
                             prefill_tp,
                             decode_tp);
@@ -115,6 +124,16 @@ StageGroupLoadPlan planStageGroupLoads(const StageGroupLoadParams& params) {
                               0,
                               whole_block_peer ? 1 : params.decode_tp_size,
                               whole_block_peer ? 0 : params.decode_tp_rank});
+        return plan;
+    }
+    /**
+     * Non-divisible TP ratio is a deployment config error, not an invariant: report a
+     * load failure here instead of tripping planStagePeerSlices' assert on every decode
+     * rank. MLA lanes own whole blocks and need no ratio.
+     */
+    if (!params.use_mla && params.decode_tp_size > 0 && !isCompatibleTpRatio(peer_count, params.decode_tp_size)) {
+        plan.error = "unsupported TP ratio prefill=" + std::to_string(peer_count) + " decode="
+                     + std::to_string(params.decode_tp_size);
         return plan;
     }
     plan.loads = planStagePeerSlices(peer_count, params.decode_tp_size, params.decode_tp_rank, params.use_mla);
