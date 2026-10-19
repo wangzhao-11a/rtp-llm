@@ -265,12 +265,17 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
         self._activation = getattr(cfg, "expert_activation", "swiglu")
         self._activation_kwargs = {}
         if self._activation == "situ":
+            self._mega_kernel = deep_gemm.fp8_fp4_mega_moe_k3
+            transform_weights = deep_gemm.transform_weights_for_mega_moe_k3
             self._activation_kwargs = situ_kwargs(
-                deep_gemm.fp8_fp4_mega_moe,
+                self._mega_kernel,
                 cfg.activation_beta,
                 cfg.activation_linear_beta,
             )
-        elif self._activation != "swiglu":
+        elif self._activation == "swiglu":
+            self._mega_kernel = deep_gemm.fp8_fp4_mega_moe
+            transform_weights = deep_gemm.transform_weights_for_mega_moe
+        else:
             raise ValueError(f"Unsupported MegaMoE activation {self._activation!r}")
         E = cfg.n_local_experts
         D = cfg.dim
@@ -301,7 +306,7 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
 
         # Mega MoE transform: L1 gate/up interleave (gran=8 along N) +
         # both SFs UTCCP-transposed. Drop inputs immediately after.
-        (l1_w, l1_sf), (l2_w, l2_sf) = deep_gemm.transform_weights_for_mega_moe(
+        (l1_w, l1_sf), (l2_w, l2_sf) = transform_weights(
             (w13, s13_int),
             (w2, s2_int),
             **({"activation": "situ"} if self._activation == "situ" else {}),
@@ -350,7 +355,7 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
         self._maybe_warmup_jit_once()
         if self._activation == "situ":
             _record_moe_activation_evidence(
-                deep_gemm.fp8_fp4_mega_moe,
+                self._mega_kernel,
                 self._activation,
                 cfg.activation_beta,
                 cfg.activation_linear_beta,
@@ -532,14 +537,12 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
             )
 
     def _launch(self, y: torch.Tensor, tokens: int, device: torch.device) -> None:
-        import deep_gemm
-
         self._maybe_pre_kernel_barrier(tokens)
         sync_cuda_graph_warmup_ranks(
             f"moe.mega_moe.layer{self.cfg.layer_id}.before_deepgemm",
             device,
         )
-        deep_gemm.fp8_fp4_mega_moe(
+        self._mega_kernel(
             y,
             (self._mega_l1_w, self._mega_l1_sf),
             (self._mega_l2_w, self._mega_l2_sf),
