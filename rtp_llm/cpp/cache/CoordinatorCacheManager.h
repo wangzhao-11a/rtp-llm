@@ -94,7 +94,8 @@ public:
                                     int                            remaining_tokens,
                                     int                            reserve_step,
                                     bool                           enable_reuse_cache,
-                                    int                            target_batch_size) const;
+                                    int                            target_batch_size,
+                                    bool                           retain_linear_checkpoints = false) const;
 
     MallocResult malloc(const MallocInfo& malloc_info);
     bool         abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
@@ -198,13 +199,15 @@ protected:
                                          int                    seq_len,
                                          int                    remaining_tokens,
                                          int                    reserve_step,
-                                         bool                   enable_reuse_cache) const;
+                                         bool                   enable_reuse_cache,
+                                         bool                   retain_linear_checkpoints = false) const;
     virtual int   estimateInitialBatchPeakNeedBlocks(int  seq_len,
                                                      int  common_seq_len,
                                                      int  remaining_tokens,
                                                      int  reserve_step,
                                                      bool enable_reuse_cache,
-                                                     int  target_batch_size) const;
+                                                     int  target_batch_size,
+                                                     bool retain_linear_checkpoints = false) const;
     virtual void  checkCPShardedMallocResult(const MallocInfo&) const;
     virtual void  decrKVCacheRef(const KVCacheResource& kvcache_resource);
     size_t        logicalSeqSizePerBlockForCapacity(const std::string& tag) const;

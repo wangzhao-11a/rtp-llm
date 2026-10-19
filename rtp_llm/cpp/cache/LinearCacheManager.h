@@ -36,12 +36,25 @@ public:
                                 int                     remaining_tokens,
                                 int                     reserve_step,
                                 bool                    enable_reuse_cache) const override;
+    int            estimatePeakNeedBlocks(int                     seq_len,
+                                          const BlockIndicesType& current_block_indices,
+                                          int                     remaining_tokens,
+                                          int                     reserve_step,
+                                          bool                    enable_reuse_cache,
+                                          bool                    retain_initial_checkpoints) const;
     int  estimateInitialBatchPeakNeedBlocks(int  seq_len,
                                             int  common_seq_len,
                                             int  remaining_tokens,
                                             int  reserve_step,
                                             bool enable_reuse_cache,
                                             int  target_batch_size) const override;
+    int            estimateInitialBatchPeakNeedBlocks(int  seq_len,
+                                                      int  common_seq_len,
+                                                      int  remaining_tokens,
+                                                      int  reserve_step,
+                                                      bool enable_reuse_cache,
+                                                      int  target_batch_size,
+                                                      bool retain_initial_checkpoints) const;
     NeedBlocksInfo getNeedBlocks(int                      common_seq_len,
                                  int                      seq_len,
                                  int                      reserve_step,

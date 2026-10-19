@@ -73,6 +73,10 @@ struct MallocInfo {
     // Lets the state machine feed the publish-time value instead of racing with the async worker.
     int incr_seq_len_override = -1;
 
+    // Chunked prefill needs recurrent checkpoints even when cross-request cache reuse is disabled.
+    // This only changes LINEAR allocation/retention; lookup and insertion still use reuse_cache.
+    bool retain_linear_checkpoints = false;
+
     int incrSeqLen() const;
 };
 

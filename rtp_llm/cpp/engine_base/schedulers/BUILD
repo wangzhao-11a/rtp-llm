@@ -1,6 +1,12 @@
 load("//:def.bzl", "copts")
 
 cc_library(
+    name = "prefill_chunk",
+    hdrs = ["PrefillChunk.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "schedulers",
     hdrs = glob([
         "*.h",

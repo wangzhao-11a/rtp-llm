@@ -159,7 +159,9 @@ int StreamCacheResource::estimatePeakNeedBlocks(
                                                                    remaining_tokens,
                                                                    reserve_step,
                                                                    reuseCache(),
-                                                                   target_batch_size);
+                                                                   target_batch_size,
+                                                                   stream_->chunkedPrefillEnabled()
+                                                                       && isContextStream());
 }
 
 void StreamCacheResource::publishReuseLengths(int total, int host, int disk, int backend) {
@@ -200,6 +202,9 @@ absl::Status StreamCacheResource::initKVBlock() {
         malloc_info.enable_cache_lookup = enableCacheLookup();
     }
     malloc_info.enable_remove_skipped_blocks = false;
+    // Chunk continuations read LINEAR checkpoints even when cross-request cache
+    // lookup/storage is disabled. Keep those checkpoints until prefill finishes.
+    malloc_info.retain_linear_checkpoints = stream_->chunkedPrefillEnabled() && isContextStream();
 
     MallocResult result = resource_context_.cache_manager->malloc(malloc_info);
     recordCacheReuseMallocResult(result);
@@ -398,6 +403,7 @@ absl::Status StreamCacheResource::incrKVBlock(int seq_len_override) {
     malloc_info.reuse_cache                  = reuseCache();
     malloc_info.enable_cache_lookup          = enableCacheLookup();
     malloc_info.enable_remove_skipped_blocks = true;
+    malloc_info.retain_linear_checkpoints    = stream_->chunkedPrefillEnabled() && isContextStream();
     malloc_info.incr_seq_len_override        = seq_len_override;
 
     auto result = resource_context_.cache_manager->malloc(malloc_info);

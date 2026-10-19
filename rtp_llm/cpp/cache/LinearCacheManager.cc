@@ -87,7 +87,18 @@ int LinearCacheManager::estimatePeakNeedBlocks(int                     seq_len,
                                                int                     remaining_tokens,
                                                int                     reserve_step,
                                                bool                    enable_reuse_cache) const {
+    return estimatePeakNeedBlocks(
+        seq_len, current_block_indices, remaining_tokens, reserve_step, enable_reuse_cache, false);
+}
+
+int LinearCacheManager::estimatePeakNeedBlocks(int                     seq_len,
+                                               const BlockIndicesType& current_block_indices,
+                                               int                     remaining_tokens,
+                                               int                     reserve_step,
+                                               bool                    enable_reuse_cache,
+                                               bool                    retain_initial_checkpoints) const {
     const int step              = std::max(1, linear_step_);
+    const bool keep_initial_checkpoints = enable_reuse_cache || retain_initial_checkpoints;
     const int current_seq_slots = (seq_len + seqSizePerBlock() - 1) / seqSizePerBlock();
     const int final_seq_slots   = (seq_len + remaining_tokens + seqSizePerBlock() - 1) / seqSizePerBlock();
     const int extra_blocks      = reserve_step ? reserve_step - 1 : 0;
@@ -106,7 +117,7 @@ int LinearCacheManager::estimatePeakNeedBlocks(int                     seq_len,
     } else {
         const int initial_slots = current_seq_slots + extra_blocks;
         for (int i = 0; i < initial_slots; ++i) {
-            block_costs.push_back(shouldMaterializeBlock(i, seq_len, reserve_step, enable_reuse_cache) ? 1 : 0);
+            block_costs.push_back(shouldMaterializeBlock(i, seq_len, reserve_step, keep_initial_checkpoints) ? 1 : 0);
         }
     }
 
@@ -121,8 +132,20 @@ int LinearCacheManager::estimateInitialBatchPeakNeedBlocks(int  seq_len,
                                                            int  reserve_step,
                                                            bool enable_reuse_cache,
                                                            int  target_batch_size) const {
+    return estimateInitialBatchPeakNeedBlocks(
+        seq_len, common_seq_len, remaining_tokens, reserve_step, enable_reuse_cache, target_batch_size, false);
+}
+
+int LinearCacheManager::estimateInitialBatchPeakNeedBlocks(int  seq_len,
+                                                           int  common_seq_len,
+                                                           int  remaining_tokens,
+                                                           int  reserve_step,
+                                                           bool enable_reuse_cache,
+                                                           int  target_batch_size,
+                                                           bool retain_initial_checkpoints) const {
     const int  step       = std::max(1, linear_step_);
     const int  batch_size = std::max(target_batch_size, 1);
+    const bool keep_initial_checkpoints = enable_reuse_cache || retain_initial_checkpoints;
     const auto seq_slots  = [&](int length) { return (length + seqSizePerBlock() - 1) / seqSizePerBlock(); };
 
     const int        common_slots   = seq_slots(common_seq_len);
@@ -134,14 +157,16 @@ int LinearCacheManager::estimateInitialBatchPeakNeedBlocks(int  seq_len,
     block_costs.reserve(static_cast<size_t>(std::max(initial_total, final_total)));
 
     for (int slot = 0; slot < common_slots; ++slot) {
-        block_costs.push_back(shouldMaterializeBlock(slot, common_seq_len, 0, enable_reuse_cache) ? 1 : 0);
+        block_costs.push_back(shouldMaterializeBlock(slot, common_seq_len, 0, keep_initial_checkpoints) ? 1 : 0);
     }
 
     // initMalloc's incrMalloc phase appends the whole prompt suffix without sparse cleanup.
     for (int slot = common_slots; slot < initial_total; ++slot) {
-        block_costs.push_back(shouldMaterializeBlock(slot, seq_len, reserve_step, enable_reuse_cache) ? batch_size : 0);
+        block_costs.push_back(
+            shouldMaterializeBlock(slot, seq_len, reserve_step, keep_initial_checkpoints) ? batch_size : 0);
     }
 
+    // Chunk checkpoints belong to the initial prompt. Decode reverts to the real reuse policy.
     return estimatePeakFromSlotCosts(std::move(block_costs),
                                      final_total,
                                      batch_size,

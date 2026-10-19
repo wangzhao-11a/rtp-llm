@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <sstream>
 
+#include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -13,15 +14,6 @@
 
 using namespace std;
 namespace rtp_llm {
-
-int64_t computeChunkGrant(int64_t budget, int64_t rows, int64_t remaining, int64_t block_size) {
-    if (budget <= 0 || rows <= 0 || remaining <= 0 || block_size <= 0) {
-        return 0;
-    }
-
-    const int64_t max_len = budget / rows;
-    return remaining <= max_len ? remaining : (max_len / block_size) * block_size;
-}
 
 FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runtime_config,
                                      const ModelConfig&                     model_config,
@@ -40,7 +32,31 @@ FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runt
         std::max<int64_t>(runtime_config.fifo_scheduler_config.max_inited_kv_cache_streams, 0)),
     prefill_chunk_size_(runtime_config.fifo_scheduler_config.prefill_chunk_size),
     need_fill_fake_stream_(parallelism_config.dp_size > 1 && parallelism_config.tp_rank == 0),
-    metrics_reporter_(metrics_reporter) {}
+    metrics_reporter_(metrics_reporter) {
+    const auto& config       = cache_manager_->cacheConfig();
+    const auto& mapper       = cache_manager_->cpSlotMapper();
+    prefill_chunk_alignment_ = combineChunkAlignment(1, config.seq_size_per_block);
+    if (mapper) {
+        prefill_chunk_alignment_ = combineChunkAlignment(prefill_chunk_alignment_, mapper->reuseBlockTokens(config));
+    }
+    for (const auto& group : config.groups()) {
+        int64_t checkpoint_tokens = group.seqSizePerBlock();
+        if (group.policy.group_type == CacheGroupType::LINEAR) {
+            const auto step = std::max(1, config.linear_step);
+            if (checkpoint_tokens > std::numeric_limits<int>::max() / step) {
+                prefill_chunk_alignment_ = 0;
+                break;
+            }
+            checkpoint_tokens *= step;
+        }
+        prefill_chunk_alignment_ = combineChunkAlignment(prefill_chunk_alignment_, checkpoint_tokens);
+    }
+    if (prefill_chunk_size_ > 0) {
+        RTP_LLM_LOG_INFO("[chunked_prefill] token_budget=%ld, intermediate_chunk_alignment=%ld",
+                         prefill_chunk_size_,
+                         prefill_chunk_alignment_);
+    }
+}
 
 bool FIFOSchedulerBase::empty() {
     lock_guard<mutex> lock(lock_);
@@ -132,13 +148,13 @@ absl::Status FIFOSchedulerBase::checkChunkedPrefillRequest(const GenerateStreamP
     const int64_t seq_length = stream->seqLength();
     const int64_t rows       = stream->currentBatchSize();
     const int64_t block_size = stream->seqSizePerBlock();
-    if (seq_length > 0 && rows > 0 && block_size > 0) {
+    if (seq_length > 0 && rows > 0 && block_size > 0 && prefill_chunk_alignment_ > 0) {
         return absl::OkStatus();
     }
 
     std::ostringstream error_msg;
     error_msg << "[chunked_prefill] invalid request shape: seq_length=" << seq_length << ", rows=" << rows
-              << ", block_size=" << block_size;
+              << ", block_size=" << block_size << ", alignment=" << prefill_chunk_alignment_;
     stream->reportError(ErrorCode::ERROR_GENERATE_CONFIG_FORMAT, error_msg.str());
     return absl::InvalidArgumentError(error_msg.str());
 }
@@ -238,7 +254,9 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
             continue;
         }
 
-        const int64_t grant = computeChunkGrant(budget_left, rows, remaining, block_size);
+        // Page-RR reuse stripes and sparse LINEAR checkpoints can span several
+        // base blocks. Every middle chunk must publish a state for its next prefix.
+        const int64_t grant = computeChunkGrant(budget_left, rows, remaining, prefill_chunk_alignment_, reuse);
 
         if (grant <= 0) {
             if (!selected.empty()) {
@@ -246,7 +264,9 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
             }
             it = finish_invalid_stream(it,
                                        ErrorCode::INVALID_PARAMS,
-                                       "full prefill budget cannot produce a positive aligned grant");
+                                       "full prefill budget cannot produce a positive aligned grant (alignment="
+                                           + std::to_string(prefill_chunk_alignment_) + ", rows=" + std::to_string(rows)
+                                           + "); increase prefill_chunk_size or reduce num_return_sequences");
             continue;
         }
 

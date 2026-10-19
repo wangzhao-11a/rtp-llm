@@ -3,6 +3,13 @@ load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_test = cc_test_wrapper
 
+cc_test(
+    name = "prefill_chunk_test",
+    srcs = ["PrefillChunkTest.cc"],
+    copts = copts(),
+    deps = ["//rtp_llm/cpp/engine_base/schedulers:prefill_chunk"],
+)
+
 cc_import(
     name = "cuda13_torch_nvshmem",
     shared_library = "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",

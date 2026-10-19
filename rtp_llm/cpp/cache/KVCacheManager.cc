@@ -511,14 +511,16 @@ int KVCacheManager::estimatePeakNeedBlocks(const BatchKVCacheResourcePtr& batch_
                                            int                            remaining_tokens,
                                            int                            reserve_step,
                                            bool                           enable_reuse_cache,
-                                           int                            target_batch_size) const {
+                                           int                            target_batch_size,
+                                           bool                           retain_linear_checkpoints) const {
     return coordinator_manager_->estimateBatchPeakNeedBlocks(batch_kv_cache_resource,
                                                              seq_len,
                                                              common_seq_len,
                                                              remaining_tokens,
                                                              reserve_step,
                                                              enable_reuse_cache,
-                                                             target_batch_size);
+                                                             target_batch_size,
+                                                             retain_linear_checkpoints);
 }
 
 // 块操作相关

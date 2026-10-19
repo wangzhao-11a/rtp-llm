@@ -1515,6 +1515,79 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, ReserveBlocksUseCPShardedFullGroup
     allocator->free(free_info);
 }
 
+TEST_F(HybridPoolCoordinatorCacheManagerTest, ChunkCheckpointsDoNotRequireCrossRequestReuse) {
+    const auto config    = makeTinyMultiPoolHybridConfig(/*linear_block_num=*/8, /*full_block_num=*/9);
+    auto       allocator = makeAllocator(config);
+    ASSERT_TRUE(allocator->init());
+    auto resource = makeBatchResource(/*batch_size=*/1, config);
+    auto tokens   = makeCompleteTokenIds(/*batch_size=*/1, /*seq_length=*/24, /*seq_size_per_block=*/4);
+    resource->setBatchCacheKeys(0, CacheKeysType{100, 101, 102, 103, 104, 105});
+
+    // Six FULL pages and the three LINEAR checkpoints at tokens 8, 16 and 24.
+    EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource, 24, 24, 0, 0, false, 1, true), 9);
+    EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource, 24, 24, 0, 0, false, 1), 7);
+    // With 80 future decode tokens, FULL peaks at 26 pages and LINEAR at four physical states.
+    // Future decode must not retain every checkpoint just because the prompt needs them.
+    EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource, 24, 24, 80, 0, false, 1, true), 30);
+
+    const size_t initial_free = allocator->freeBlocksNum();
+    MallocInfo   info{resource, tokens};
+    info.reuse_cache                  = false;
+    info.enable_cache_lookup          = false;
+    info.enable_remove_skipped_blocks = false;
+    info.retain_linear_checkpoints    = true;
+    const auto result                 = allocator->malloc(info);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.reuse_len, 0);
+    EXPECT_FALSE(result.load_attempted);
+    EXPECT_EQ(initial_free - allocator->freeBlocksNum(), 9u);
+    const auto& blocks = resource->blocks(0, "linear");
+    ASSERT_EQ(blocks.size(), 6u);
+    for (size_t position = 0; position < blocks.size(); ++position) {
+        EXPECT_EQ(isNullBlockIdx(blocks[position]), position % 2 == 0);
+    }
+    EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource, 24, 24, 0, 0, false, 1, true), 0);
+    EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource, 24, 24, 80, 0, false, 1, true), 21);
+
+    // Once decode starts, the original no-reuse tail cleanup can reclaim old checkpoints.
+    info.retain_linear_checkpoints    = false;
+    info.enable_remove_skipped_blocks = true;
+    tokens->setSeqLength(25);
+    ASSERT_TRUE(allocator->malloc(info).success);
+    EXPECT_TRUE(isNullBlockIdx(resource->blocks(0, "linear")[1]));
+    EXPECT_TRUE(isNullBlockIdx(resource->blocks(0, "linear")[3]));
+    EXPECT_EQ(validBlockCount(resource->blocks(0, "linear")), 2u);
+    allocator->free(FreeInfo{resource, tokens});
+    EXPECT_EQ(allocator->freeBlocksNum(), initial_free);
+}
+
+TEST_F(HybridPoolCoordinatorCacheManagerTest, ChunkCheckpointCapacityCountsPhysicalStatesWithoutReuse) {
+    // Two usable LINEAR blocks fit the ordinary tail, but cannot hold all three required checkpoints.
+    const auto config = makeTinyMultiPoolHybridConfig(/*linear_block_num=*/3, /*full_block_num=*/8);
+    for (const bool retain_checkpoints : {false, true}) {
+        auto allocator = makeAllocator(config);
+        ASSERT_TRUE(allocator->init());
+        auto resource = makeBatchResource(/*batch_size=*/1, config);
+        auto tokens   = makeCompleteTokenIds(/*batch_size=*/1, /*seq_length=*/24, /*seq_size_per_block=*/4);
+        resource->setBatchCacheKeys(0, CacheKeysType{100, 101, 102, 103, 104, 105});
+        const size_t initial_free = allocator->freeBlocksNum();
+        MallocInfo   info{resource, tokens};
+        info.reuse_cache                  = false;
+        info.enable_cache_lookup          = false;
+        info.enable_remove_skipped_blocks = false;
+        info.retain_linear_checkpoints    = retain_checkpoints;
+        const auto result                 = allocator->malloc(info);
+        EXPECT_EQ(result.success, !retain_checkpoints);
+        if (retain_checkpoints) {
+            EXPECT_EQ(result.status, MallocStatus::PERMANENT_RESOURCE_EXHAUSTED);
+            EXPECT_EQ(resource->curBlocksNum(), 0u);
+        } else {
+            allocator->free(FreeInfo{resource, tokens});
+        }
+        EXPECT_EQ(allocator->freeBlocksNum(), initial_free);
+    }
+}
+
 TEST_F(HybridPoolCoordinatorCacheManagerTest, PreparedSWALoadReserveRejectsPoolLocalShortfall) {
     auto config    = makeTinySwaMultiPoolHybridConfig(/*linear_block_num=*/8, /*swa_block_num=*/4);
     auto allocator = makeAllocator(config);
