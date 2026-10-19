@@ -382,6 +382,50 @@ class DraftPPLoadingTest(unittest.TestCase):
                     )
 
 
+class PPOwnsWeightTest(unittest.TestCase):
+    """owns_pp_weight mirrors the load-time PP partition so online weight sync can
+    skip a weight this rank does not hold (the update is broadcast to every rank)."""
+
+    EMBEDDING_NAMES = [W.embedding, W.positional_embedding]
+    OUTPUT_NAMES = [W.lm_head, W.final_ln_gamma, W.final_ln_beta]
+
+    def test_layer_ownership_follows_stage_range(self):
+        owned_by_rank = {0: {0, 1}, 1: {2, 3, 4}, 2: {5, 6}}  # 7 layers over pp_size=3
+        for pp_rank in range(3):
+            with self.subTest(pp_rank=pp_rank):
+                loader = make_loader(make_load_config(7, 3, pp_rank, [2, 3, 2]))
+                for layer_id in range(7):
+                    self.assertEqual(
+                        loader.owns_pp_weight(
+                            f"model.layers.{layer_id}.mlp.weight", layer_id
+                        ),
+                        layer_id in owned_by_rank[pp_rank],
+                    )
+
+    def test_global_ownership_follows_stage(self):
+        for pp_rank, owns_emb, owns_out in (
+            (0, True, False),
+            (1, False, False),
+            (2, False, True),
+        ):
+            with self.subTest(pp_rank=pp_rank):
+                loader = make_loader(make_load_config(7, 3, pp_rank, [2, 3, 2]))
+                for name in self.EMBEDDING_NAMES:
+                    self.assertEqual(loader.owns_pp_weight(name, None), owns_emb)
+                for name in self.OUTPUT_NAMES:
+                    self.assertEqual(loader.owns_pp_weight(name, None), owns_out)
+
+    def test_non_pp_owns_every_weight(self):
+        # pp_size=1: a single stage holds the whole model, so nothing is skipped.
+        loader = make_loader(make_load_config(7, 1, 0, None))
+        for layer_id in range(7):
+            self.assertTrue(
+                loader.owns_pp_weight(f"model.layers.{layer_id}.x", layer_id)
+            )
+        for name in self.EMBEDDING_NAMES + self.OUTPUT_NAMES:
+            self.assertTrue(loader.owns_pp_weight(name, None))
+
+
 class PPMaterializedPartitionTest(unittest.TestCase):
     """The materialized partition is consumed by prefix-sum lookup."""
 

@@ -621,6 +621,15 @@ class ModelLoader:
         # TODO(PP+MTP): restrict multi_tokens_predict_* (MTP head) weights to the last stage.
         return False
 
+    def owns_pp_weight(self, name: str, layer_id: int | None) -> bool:
+        """Whether the PP loading partition placed this weight on the current rank.
+
+        Online weight sync broadcasts to all ranks; a non-owner skips, its owner updates.
+        """
+        if layer_id is not None:
+            return layer_id in self._layer_ids
+        return not self._skip_pp_global_weight(name)
+
     @staticmethod
     def force_clean_cuda_memory():
         """安全清理显存，避免残留引用"""
