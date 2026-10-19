@@ -481,44 +481,44 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
             /** Runtime uses active module 0. */
             break;
         }
-        if (isStageRoot()) {
-            const auto& draft_weights = propose_params->getEngineInitParams().gpt_weights;
-            const auto& d2t_map       = draft_model_ ? draft_model_->weights_.d2t_map : draft_weights.d2t_map;
-            if (is_dspark_ && role_type_ != RoleType::PREFILL) {
-                dspark_markov_w1_ = draft_weights.dspark_markov_w1;
-                dspark_markov_w2_ = draft_weights.dspark_markov_w2;
-                RTP_LLM_CHECK_WITH_INFO(dspark_markov_w1_.defined() && dspark_markov_w2_.defined(),
-                                        "PP DSpARK requires markov_w1 and markov_w2 weights");
-                const int64_t padded_draft_vocab_size = (static_cast<int64_t>(draft_vocab_size_) + 127) / 128 * 128;
-                RTP_LLM_CHECK_WITH_INFO(dspark_markov_w1_.is_cuda() && dspark_markov_w2_.is_cuda()
-                                            && dspark_markov_w1_.dim() == 2 && dspark_markov_w2_.dim() == 2
-                                            && dspark_markov_w1_.size(1) == dspark_markov_w2_.size(1)
-                                            && dspark_markov_w1_.size(0) >= params.model_config_.vocab_size
-                                            && dspark_markov_w2_.size(0) >= static_cast<int64_t>(draft_vocab_size_)
-                                            && dspark_markov_w2_.size(0) <= padded_draft_vocab_size
-                                            && dspark_markov_w1_.scalar_type() == dspark_markov_w2_.scalar_type(),
-                                        "PP DSpARK Markov weights must be CUDA [target_vocab,rank] and "
-                                        "[draft_vocab,rank] tensors with matching rank and dtype");
-                dspark_markov_w2_ = dspark_markov_w2_.narrow(0, 0, static_cast<int64_t>(draft_vocab_size_));
-                if (draft_vocab_size_ != static_cast<size_t>(params.model_config_.vocab_size)) {
-                    RTP_LLM_CHECK_WITH_INFO(d2t_map.defined() && d2t_map.is_cuda() && d2t_map.dim() == 1
-                                                && d2t_map.scalar_type() == torch::kInt64
-                                                && d2t_map.numel() == static_cast<int64_t>(draft_vocab_size_),
-                                            "reduced-vocabulary PP DSpARK requires a CUDA int64 d2t map");
-                    const auto d2t_min = d2t_map.min().item<int64_t>();
-                    const auto d2t_max = d2t_map.max().item<int64_t>();
-                    RTP_LLM_CHECK_WITH_INFO(d2t_min >= 0 && d2t_max < params.model_config_.vocab_size,
-                                            "PP DSpARK d2t target ids must be in [0,%ld), got range [%ld,%ld]",
-                                            params.model_config_.vocab_size,
-                                            d2t_min,
-                                            d2t_max);
-                }
-            } else if (!is_dspark_) {
-                fast_topk_sampler_ = std::make_unique<speculative::FastTopKSampler>(d2t_map);
+        const auto& draft_weights = propose_params->getEngineInitParams().gpt_weights;
+        const auto& d2t_map       = draft_model_ ? draft_model_->weights_.d2t_map : draft_weights.d2t_map;
+        if (is_dspark_ && role_type_ != RoleType::PREFILL) {
+            dspark_markov_w1_ = draft_weights.dspark_markov_w1;
+            dspark_markov_w2_ = draft_weights.dspark_markov_w2;
+            RTP_LLM_CHECK_WITH_INFO(dspark_markov_w1_.defined() && dspark_markov_w2_.defined(),
+                                    "PP DSpARK requires markov_w1 and markov_w2 weights");
+            const int64_t padded_draft_vocab_size = (static_cast<int64_t>(draft_vocab_size_) + 127) / 128 * 128;
+            RTP_LLM_CHECK_WITH_INFO(dspark_markov_w1_.is_cuda() && dspark_markov_w2_.is_cuda()
+                                        && dspark_markov_w1_.dim() == 2 && dspark_markov_w2_.dim() == 2
+                                        && dspark_markov_w1_.size(1) == dspark_markov_w2_.size(1)
+                                        && dspark_markov_w1_.size(0) >= params.model_config_.vocab_size
+                                        && dspark_markov_w2_.size(0) >= static_cast<int64_t>(draft_vocab_size_)
+                                        && dspark_markov_w2_.size(0) <= padded_draft_vocab_size
+                                        && dspark_markov_w1_.scalar_type() == dspark_markov_w2_.scalar_type(),
+                                    "PP DSpARK Markov weights must be CUDA [target_vocab,rank] and "
+                                    "[draft_vocab,rank] tensors with matching rank and dtype");
+            dspark_markov_w2_ = dspark_markov_w2_.narrow(0, 0, static_cast<int64_t>(draft_vocab_size_));
+            if (draft_vocab_size_ != static_cast<size_t>(params.model_config_.vocab_size)) {
+                RTP_LLM_CHECK_WITH_INFO(d2t_map.defined() && d2t_map.is_cuda() && d2t_map.dim() == 1
+                                            && d2t_map.scalar_type() == torch::kInt64
+                                            && d2t_map.numel() == static_cast<int64_t>(draft_vocab_size_),
+                                        "reduced-vocabulary PP DSpARK requires a CUDA int64 d2t map");
+                const auto d2t_min = d2t_map.min().item<int64_t>();
+                const auto d2t_max = d2t_map.max().item<int64_t>();
+                RTP_LLM_CHECK_WITH_INFO(d2t_min >= 0 && d2t_max < params.model_config_.vocab_size,
+                                        "PP DSpARK d2t target ids must be in [0,%ld), got range [%ld,%ld]",
+                                        params.model_config_.vocab_size,
+                                        d2t_min,
+                                        d2t_max);
             }
-            speculative_sampler_       = std::make_unique<speculative::SpeculativeSampler>(d2t_map, propose_step_);
-            spec_logits_verify_runner_ = std::make_unique<SpecLogitsVerifyRunner>();
         }
+        speculative_sampler_ = std::make_unique<speculative::SpeculativeSampler>(d2t_map, propose_step_);
+        if (!is_dspark_) {
+            /** Each TP rank needs a greedy sampler to advance draft tokens without another broadcast. */
+            fast_topk_sampler_ = std::make_unique<speculative::FastTopKSampler>(d2t_map);
+        }
+        spec_logits_verify_runner_ = std::make_unique<SpecLogitsVerifyRunner>();
     }
 
     const auto& cache_config = cache_manager_ ? cache_manager_->cacheConfig() : CacheConfig();
@@ -1148,27 +1148,31 @@ void PPExecutor::runDraftStep(GptModelInputs&       target_input,
                 proposed_all_probs        = draft_sampler_output.all_probs;
             }
         } else {
-            for (int64_t step = 1; step < propose_step_; ++step) {
+            /** Batch/KV layout stays fixed. Sync once and advance locally to avoid
+             * repacking and transferring unchanged inputs at every decode step. */
+            if (propose_step_ > 1) {
                 tpSyncModelInputs(draft_input, parallelism_config_);
+            }
+            for (int64_t step = 1; step < propose_step_; ++step) {
                 auto draft_output = forwardDraftModel(*draft_model_, draft_input);
                 mtp::maybeOverrideLastHiddenWithMtpBuffer(
                     draft_output, *draft_model_, draft_input.combo_tokens.numel());
 
+                const bool has_next_step = step + 1 < propose_step_;
+                auto       draft_tokens  = fast_topk_sampler_->forward(draft_output.logits, 1).token_ids;
+                /** Keep int32 input for the next forward; copy_ casts the final proposal directly. */
+                if (has_next_step) {
+                    draft_tokens = draft_tokens.to(torch::kInt32);
+                }
                 if (isStageRoot()) {
-                    const bool has_next_step = step + 1 < propose_step_;
-                    auto       draft_tokens  = fast_topk_sampler_->forward(draft_output.logits, 1).token_ids;
-                    /** Keep int32 input for the next forward; copy_ casts the final proposal directly. */
-                    if (has_next_step) {
-                        draft_tokens = draft_tokens.to(torch::kInt32);
-                    }
                     proposed_token_ids.select(1, step).copy_(draft_tokens.flatten());
-                    if (has_next_step) {
-                        mtp::advanceDraftInput(draft_input,
-                                               draft_output.all_hidden_states,
-                                               draft_tokens,
-                                               position_id_len_factor_,
-                                               buffer_holder_);
-                    }
+                }
+                if (has_next_step) {
+                    mtp::advanceDraftInput(draft_input,
+                                           draft_output.all_hidden_states,
+                                           draft_tokens,
+                                           position_id_len_factor_,
+                                           buffer_holder_);
                 }
             }
         }

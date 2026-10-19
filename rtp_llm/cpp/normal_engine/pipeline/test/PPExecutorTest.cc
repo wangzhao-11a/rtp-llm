@@ -112,7 +112,8 @@ public:
         if (!hidden_buffer.defined() || hidden_buffer.size(0) < rows) {
             hidden_buffer = torch::empty({rows, 4}, options);
         }
-        hidden_buffer.narrow(0, 0, rows).copy_(torch::arange(rows * 4, options).reshape({rows, 4}) + step * 100);
+        hidden_buffer.narrow(0, 0, rows).copy_(
+            torch::arange(rows * 4, options).reshape({rows, 4}) + step * 100 + hidden_offset);
         GptModelOutputs output;
         output.all_hidden_states = hidden_buffer.narrow(0, 0, rows).narrow(1, 0, 2);
         if (input.skip_lm_head) {
@@ -153,6 +154,7 @@ public:
     torch::Tensor         hidden_buffer;
     torch::Tensor         scripted_logits;
     bool                  expose_mtp_hidden = true;
+    int64_t               hidden_offset     = 0;
 };
 
 class RecordingCPTargetModel: public RecordingDraftModel {
@@ -3997,8 +3999,110 @@ TEST_F(PPExecutorTest, LastDraftChainUsesTargetAndPreviousDraftHidden) {
     }
 }
 
+TEST_F(PPExecutorTpTest, LastDraftDecodeSynchronizesOnlyItsInitialInput) {
+    for (const auto type : {SP_TYPE_MTP, SP_TYPE_EAGLE}) {
+        for (const int64_t width : {1, 2, 3}) {
+            for (const bool expose_mtp_hidden : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "type=" << type << ", width=" << width
+                                                  << ", mtp_hidden=" << expose_mtp_hidden);
+                ReplayTpBroadcast broadcasts;
+                std::vector<size_t> root_forward_positions;
+                for (const int rank : {0, 1}) {
+                    SCOPED_TRACE(rank);
+                    if (rank != 0) {
+                        broadcasts.replay();
+                    }
+                    auto params  = makeTpStageParams(2, rank, type, width);
+                    auto propose = makeMtpProposeParams(params);
+                    propose->mtp_model_params_->front()->gpt_weights.d2t_map =
+                        63 - torch::arange(64, torch::TensorOptions(torch::kInt64).device(torch::kCUDA));
+                    PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
+                    ASSERT_NE(executor.fast_topk_sampler_, nullptr);
+                    executor.position_id_len_factor_ = 2;
+
+                    auto  model                = std::make_unique<RecordingDraftModel>();
+                    auto* recorded             = model.get();
+                    recorded->expose_mtp_hidden = expose_mtp_hidden;
+                    /** Rank-specific hidden values catch accidental rebroadcasts. */
+                    recorded->hidden_offset = rank * 1000;
+                    std::vector<size_t> forward_positions;
+                    recorded->on_forward = [&] { forward_positions.push_back(broadcasts.position()); };
+                    executor.draft_model_ = std::move(model);
+
+                    GptModelInputs input;
+                    input.combo_tokens             = intTensor({0, 1, 0, 3, 4});
+                    input.input_lengths            = intTensor({2, 3});
+                    input.prefix_lengths           = intTensor({3, 5});
+                    input.sequence_lengths         = intTensor({});
+                    input.lm_output_indexes        = intTensor({1, 4});
+                    input.combo_position_ids       = intTensor({3, 103, 4, 104, 5, 105, 6, 106, 7, 107});
+                    input.kv_cache_block_id         = intTensor({1, 2, 3, 4, 5, 6}).reshape({2, 3});
+                    input.kv_cache_kernel_block_id = input.kv_cache_block_id.clone();
+                    const int64_t hidden_width = expose_mtp_hidden ? 4 : 2;
+                    auto target_hidden = torch::arange(20, torch::TensorOptions(torch::kFloat32).device(torch::kCUDA))
+                                             .reshape({5, 4})
+                                             .narrow(1, 0, hidden_width);
+                    PPExecutionResult result;
+                    if (rank == 0) {
+                        result.new_token_ids     = intTensor({2, 5}).reshape({2, 1});
+                        result.new_token_lengths = intTensor({1, 1});
+                    }
+                    executor.runDraftStep(input, intTensor({5, 105, 8, 108}), target_hidden, false, {}, result);
+
+                    ASSERT_EQ(recorded->inputs.size(), static_cast<size_t>(width));
+                    ASSERT_EQ(forward_positions.size(), static_cast<size_t>(width));
+                    EXPECT_GT(forward_positions.front(), 0u);
+                    if (width > 1) {
+                        EXPECT_GT(forward_positions[1], forward_positions[0]);
+                    }
+                    /** Only the prefill-to-decode transition broadcasts; later forwards reuse local state. */
+                    for (int64_t step = 2; step < width; ++step) {
+                        EXPECT_EQ(forward_positions[step], forward_positions[1]);
+                    }
+                    EXPECT_EQ(broadcasts.position(), forward_positions.back());
+                    for (int64_t step = 1; step < width; ++step) {
+                        const auto& decode = recorded->inputs[step];
+                        const auto  offset = static_cast<int32_t>(step);
+                        EXPECT_TRUE(torch::equal(decode.combo_tokens.cpu(), intTensor({55 - 2 * offset, 54 - 2 * offset})));
+                        EXPECT_TRUE(torch::equal(decode.input_lengths.cpu(), intTensor({1, 1})));
+                        EXPECT_TRUE(torch::equal(decode.sequence_lengths.cpu(),
+                                                 intTensor({4 + offset, 7 + offset})));
+                        EXPECT_TRUE(torch::equal(decode.combo_position_ids.cpu(),
+                                                 intTensor({5 + offset, 105 + offset, 8 + offset, 108 + offset})));
+                        EXPECT_TRUE(torch::equal(decode.kv_cache_block_id.cpu(), input.kv_cache_block_id));
+                        EXPECT_TRUE(
+                            torch::equal(decode.kv_cache_kernel_block_id.cpu(), input.kv_cache_kernel_block_id));
+                        auto expected_hidden = step == 1 ?
+                            torch::tensor({{4.f, 5.f, 6.f, 7.f}, {16.f, 17.f, 18.f, 19.f}}) :
+                            torch::arange(8, torch::kFloat32).reshape({2, 4}) + (step - 1) * 100 + rank * 1000;
+                        EXPECT_TRUE(
+                            torch::equal(decode.last_hidden_states.cpu(), expected_hidden.narrow(1, 0, hidden_width)));
+                    }
+                    if (rank == 0) {
+                        root_forward_positions = forward_positions;
+                        std::vector<int32_t> expected_tokens;
+                        for (int row = 0; row < 2; ++row) {
+                            for (int64_t step = 0; step < width; ++step) {
+                                expected_tokens.push_back(static_cast<int32_t>(53 - 2 * step - row));
+                            }
+                        }
+                        EXPECT_TRUE(torch::equal(result.propose_token_ids,
+                                                 intTensor(std::move(expected_tokens)).reshape({2, width})));
+                    } else {
+                        EXPECT_EQ(forward_positions, root_forward_positions);
+                        EXPECT_EQ(broadcasts.position(), broadcasts.size());
+                        EXPECT_FALSE(result.propose_token_ids.defined());
+                        EXPECT_FALSE(result.propose_all_probs.defined());
+                    }
+                    EXPECT_TRUE(executor.sampling_states_.empty());
+                }
+            }
+        }
+    }
+}
+
 /** Last-stage TP/CP: replay one stage's root broadcasts and retain rank-local CP features. */
-TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfSampling) {
+TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfTargetSampling) {
     for (auto type : {SP_TYPE_MTP, SP_TYPE_DSPARK}) {
         for (bool all_failed : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "type=" << type << ", all_failed=" << all_failed);
@@ -4013,7 +4117,19 @@ TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfS
                 }
                 auto params = makeTpStageParams(2, rank, type);
                 auto propose = makeMtpProposeParams(params);
+                if (type == SP_TYPE_DSPARK) {
+                    propose->mtp_model_params_->front()->gpt_weights.dspark_markov_w2 =
+                        torch::zeros({128, 1}, torch::TensorOptions(torch::kFloat32).device(torch::kCUDA));
+                }
                 PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
+                ASSERT_NE(executor.speculative_sampler_, nullptr);
+                ASSERT_NE(executor.spec_logits_verify_runner_, nullptr);
+                if (type == SP_TYPE_DSPARK) {
+                    const auto& weights = propose->mtp_model_params_->front()->gpt_weights;
+                    EXPECT_EQ(executor.dspark_markov_w1_.data_ptr(), weights.dspark_markov_w1.data_ptr());
+                    EXPECT_EQ(executor.dspark_markov_w2_.data_ptr(), weights.dspark_markov_w2.data_ptr());
+                    EXPECT_EQ(executor.dspark_markov_w2_.size(0), 64);
+                }
                 auto plan = makePlan(params, true);
                 if (type == SP_TYPE_MTP) {
                     executor.position_id_len_factor_ = 2;
@@ -4042,6 +4158,11 @@ TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfS
                 EXPECT_TRUE(recorded_target->inputs[0].is_target_verify);
                 EXPECT_FALSE(recorded_target->inputs[0].pp_intermediates.empty());
                 ASSERT_EQ(draft_inputs->size(), type == SP_TYPE_MTP ? 3u : 2u);
+                ASSERT_EQ(forward_positions.size(), 1 + draft_inputs->size());
+                if (type == SP_TYPE_MTP) {
+                    /** Draft decode stays local after accepted-row synchronization. */
+                    EXPECT_EQ(forward_positions[3], forward_positions[2]);
+                }
                 for (const auto& input : *draft_inputs) {
                     EXPECT_TRUE(input.pp_intermediates.empty());
                 }
@@ -4066,6 +4187,12 @@ TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfS
                                                  root_inputs[step].input_lengths.cpu()));
                         EXPECT_TRUE(torch::equal(draft_inputs->at(step).prefix_lengths.cpu(),
                                                  root_inputs[step].prefix_lengths.cpu()));
+                        EXPECT_TRUE(torch::equal(draft_inputs->at(step).sequence_lengths.cpu(),
+                                                 root_inputs[step].sequence_lengths.cpu()));
+                        if (type == SP_TYPE_MTP) {
+                            EXPECT_TRUE(torch::equal(draft_inputs->at(step).combo_position_ids.cpu(),
+                                                     root_inputs[step].combo_position_ids.cpu()));
+                        }
                     }
                 }
                 if (type == SP_TYPE_MTP) {
@@ -4108,6 +4235,11 @@ TEST_F(PPExecutorTpTest, PrefillOnlyTpPeersFollowTheSameDraftScheduleAndKeepCpFe
                         params.parallelism_config.prefill_cp_config.method = CPRotateMethod::ALL_GATHER;
                     }
                     auto propose = makeMtpProposeParams(params);
+                    if (type == SP_TYPE_DSPARK && params.pd_sep_config.role_type == RoleType::PREFILL) {
+                        /** Commit-only checkpoints omit proposal weights on every TP rank. */
+                        propose->mtp_model_params_->front()->gpt_weights.dspark_markov_w1 = torch::Tensor();
+                        propose->mtp_model_params_->front()->gpt_weights.dspark_markov_w2 = torch::Tensor();
+                    }
                     PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO,
                                         nullptr, nullptr, propose.get());
                     auto* wire = attachTransport(executor);
