@@ -81,6 +81,7 @@ arch_with_version_dep = select({
 })
 
 requirement([
+    "filelock",
     "sentencepiece",
     "transformers",
     "pynvml",
@@ -148,6 +149,7 @@ requirement([
 
 
 _JIT_CACHE_SRCS = [
+    "utils/flashinfer_cache_eviction.py",
     "utils/jit_cache_manager.py",
     "utils/jit_cache_store.py",
     "utils/jit_cache_deep_gemm.py",
@@ -191,6 +193,7 @@ py_library(
     name = "jit_cache_manager_lib",
     srcs = _JIT_CACHE_SRCS,
     deps = [
+        ":filelock",
         ":jit_cache_env",
         ":utils",
         ":watchdog",

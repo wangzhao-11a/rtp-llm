@@ -188,6 +188,28 @@ class WrapperCacheSetupTest(JitCacheTestBase):
         ensure.assert_called_once_with(cache)
         self.assertEqual(os.environ["FLASHINFER_WORKSPACE_BASE"], str(base.resolve()))
 
+    def test_eviction_walks_the_flashinfer_cache_dir_not_the_workspace_base(self):
+        # Regression: eviction used to walk FLASHINFER_WORKSPACE_BASE itself,
+        # which is the home directory by default. os.walk($HOME) covers every
+        # worktree and Bazel output cache on the host -- tens of millions of
+        # directories, minutes of uninterruptible disk I/O that outlives any
+        # test timeout.
+        home = self.root / "home"
+        home.mkdir()
+        walked = []
+
+        def record_walk(top, **_):
+            walked.append(str(top))
+            return iter([])
+
+        with mock.patch.object(Path, "home", return_value=home), mock.patch.object(
+            wrapper_cache.os, "walk", side_effect=record_walk
+        ):
+            wrapper_cache.setup_jit_cache(packages=[])
+
+        self.assertEqual(walked, [str(home / ".cache" / "flashinfer")])
+        self.assertEqual(os.environ["FLASHINFER_WORKSPACE_BASE"], str(home))
+
     def test_explicit_writable_cache_is_preserved(self):
         explicit = self.root / "explicit"
         os.environ["TRITON_CACHE_DIR"] = str(explicit)
@@ -1255,6 +1277,72 @@ class ManagerTest(JitCacheTestBase):
             manager.publish_pending_snapshot()
         self.assertEqual(len(snapshots(managers[0].store)), 2)
 
+
+
+    def _flashinfer_component(self, scope):
+        return next(item for item in scope.components if item.name == "flashinfer")
+
+    def _write_cached_op(self, scope, name, ninja_body):
+        component = self._flashinfer_component(scope)
+        op_dir = (
+            component.local_dir
+            / ".cache"
+            / "flashinfer"
+            / "1_0"
+            / "sm_90"
+            / "cached_ops"
+            / name
+        )
+        op_dir.mkdir(parents=True, exist_ok=True)
+        (op_dir / "build.ninja").write_text(ninja_body)
+        return op_dir
+
+    def test_bootstrap_evicts_poisoned_flashinfer_ops(self):
+        # A snapshot can carry an op whose ninja rules anchor to a dead runfiles
+        # tree; restoring it must not leave the next server compiling against
+        # dangling inputs, and the cleanup has to be republished.
+        scope = self.make_scope()
+        manager = self.make_manager(scope)
+        self.publish_remote(
+            manager,
+            str(
+                self._flashinfer_component(scope).local_dir.relative_to(scope.root)
+            )
+            + "/.cache/flashinfer/1_0/sm_90/cached_ops/healthy/build.ninja",
+            b"build x: compile /opt/stable/include/a.cu\n",
+        )
+        poisoned = self._write_cached_op(
+            scope,
+            "poisoned",
+            "build x: compile /tmp/abc.runfiles/pkg/include/a.cu\n",
+        )
+        healthy = self.write_artifact(
+            scope,
+            str(
+                self._flashinfer_component(scope).local_dir.relative_to(scope.root)
+            )
+            + "/.cache/flashinfer/1_0/sm_90/cached_ops/healthy/keep.cu",
+        )
+
+        with self.assertLogs(level="INFO") as logs:
+            self.assertTrue(manager.bootstrap(timeout_s=30))
+
+        self.assertFalse(poisoned.exists(), "poisoned op must be evicted")
+        self.assertTrue(healthy.exists(), "healthy op must survive")
+        self.assertIn("evicted 1 stale FlashInfer op", "\n".join(logs.output))
+
+    def test_bootstrap_keeps_healthy_flashinfer_ops(self):
+        scope = self.make_scope()
+        manager = self.make_manager(scope)
+        include = self.root / "stable_include"
+        include.mkdir(parents=True, exist_ok=True)
+        healthy = self._write_cached_op(
+            scope,
+            "healthy_only",
+            f"build x: compile -I{include} /opt/toolkit/a.cu\n",
+        )
+        self.assertTrue(manager.bootstrap(timeout_s=30))
+        self.assertTrue(healthy.exists(), "no eviction without a stale anchor")
 
 class BackendTest(JitCacheTestBase):
     def make_configs(self, remote="", world_size=1):

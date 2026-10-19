@@ -70,6 +70,17 @@ py_test(
     ],
 )
 
+py_test(
+    name = "jit_flashinfer_eviction_test",
+    size = "small",
+    srcs = [
+        "jit_flashinfer_eviction_test.py",
+    ],
+    deps = [
+        "//rtp_llm/test/utils:jit_sys_path_setup",
+    ],
+)
+
 # Extra deps beyond the smoke framework for the JIT cache lifecycle smokes.
 _JIT_SMOKE_EXTRA_DEPS = [
     "//rtp_llm:jit_cache_manager_lib",

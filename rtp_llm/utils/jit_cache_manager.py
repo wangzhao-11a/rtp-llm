@@ -21,6 +21,10 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from rtp_llm.utils import jit_cache_store as store
+from rtp_llm.utils.flashinfer_cache_eviction import (
+    evict_dangling_flashinfer_ops,
+    flashinfer_cache_dir,
+)
 from rtp_llm.utils.jit_cache_deep_gemm import (
     deep_gemm_build_scope,
     deepjit_entry_files,
@@ -320,7 +324,45 @@ class JitCacheManager(FileSystemEventHandler):
             with suppress(OSError):  # seed an empty remote once; restarts stay quiet
                 if not any(self.store.remote_root.glob(f"*{store.SNAPSHOT_SUFFIX}")):
                     self._dirty.set()
-        return self._start_watch()
+        started = self._start_watch()
+        self._evict_poisoned_flashinfer_ops()
+        return started
+
+    def _evict_poisoned_flashinfer_ops(self) -> None:
+        """Sweep the restored FlashInfer component before kernels load.
+
+        The launcher's sweep only covers the client's ``$HOME/.cache/flashinfer``;
+        servers compile FlashInfer into this managed component directory, so a
+        snapshot can restore a poisoned op onto a fresh worker. Clean it here and
+        mark the snapshot dirty, otherwise the next restore brings it back.
+        """
+        component = next(
+            (item for item in self.scope.components if item.name == "flashinfer"),
+            None,
+        )
+        if component is None:
+            return
+        cache_dir = flashinfer_cache_dir(Path(component.local_dir))
+        if not cache_dir.is_dir():
+            return
+        try:
+            evicted, skipped = evict_dangling_flashinfer_ops(
+                cache_dir, lock_timeout_s=30.0
+            )
+        except Exception:  # noqa: BLE001 - a sweep must never break startup
+            logging.warning(
+                "JIT_CACHE_FAIL_OPEN: flashinfer sweep failed", exc_info=True
+            )
+            return
+        if evicted:
+            self._dirty.set()
+            logging.warning(
+                "JIT cache: evicted %d stale FlashInfer op(s) (%d skipped) from %s; "
+                "snapshot marked dirty so the cleanup is republished",
+                evicted,
+                skipped,
+                cache_dir,
+            )
 
     def _start_watch(self) -> bool:
         try:

@@ -29,7 +29,12 @@ py_library(
 py_library(
     name = "jit_sys_path_setup",
     srcs = ["jit_sys_path_setup.py"],
-    deps = [":filelock", "//rtp_llm:jit_cache_env"],
+    deps = [
+        ":filelock",
+        "//rtp_llm:jit_cache_env",
+        # shared sweep rules live with the JIT cache manager
+        "//rtp_llm:jit_cache_manager_lib",
+    ],
 )
 
 py_binary(
