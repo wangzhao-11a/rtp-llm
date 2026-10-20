@@ -489,10 +489,236 @@ class DeviceResource:
             logging.info("release done")
 
 
-def _run_test_command():
-    result = subprocess.run(sys.argv[1:])
-    logging.info("exitcode: %d", result.returncode)
-    return result.returncode
+# The acquire timeout only bounds the wait for devices. A test that owns its
+# GPUs used to run with no bound at all: a silent hang (observed:
+# test_prefill_workspace and test_mtp_hidden_buffer each held four cards for
+# 1.5-2h+, and test_embedding_tp4 sat in [Sched] for 4647s) only ended when the
+# lane's bazel timeout killed the whole job. The watchdog below bounds the test
+# itself and names the node and cards that were stuck.
+
+_WATCHDOG_EXIT_CODE = 70
+_WATCHDOG_SIGNAL_GRACE_SECONDS = 30
+_WATCHDOG_POLL_SECONDS = 0.5
+_IS_POSIX = os.name == "posix"
+
+
+def _watchdog_seconds() -> int:
+    """Runtime budget for a started test; defaults to 1800s, <=0 disables it."""
+    raw = os.environ.get("RTP_TEST_WATCHDOG_SECONDS", "1800")
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("invalid RTP_TEST_WATCHDOG_SECONDS=%r; using 1800", raw)
+        return 1800
+
+
+def _visible_gpus(env_name: str = "CUDA_VISIBLE_DEVICES") -> str:
+    """Device list this test runs on, for log lines (NVIDIA or ROCm)."""
+    if env_name == "HIP_VISIBLE_DEVICES":
+        return os.environ.get(env_name, "")
+    return os.environ.get(env_name) or os.environ.get("HIP_VISIBLE_DEVICES", "")
+
+
+def _log_test_placement() -> None:
+    """Pin node and cards into the log, so any later failure is locatable.
+
+    Never raises: diagnostics must not fail a test run.
+    """
+    gpus = _visible_gpus()
+    uuids = "<unavailable>"
+    smi = _nvidia_smi()
+    if smi is not None and gpus.strip():
+        try:
+            result = subprocess.run(
+                [smi, "-i", gpus, "--query-gpu=uuid", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                found = [
+                    line.strip()
+                    for line in (result.stdout or "").splitlines()
+                    if line.strip()
+                ]
+                uuids = ",".join(found) if found else "<unavailable>"
+            else:
+                logging.warning(
+                    "nvidia-smi uuid query failed (rc=%s): %s",
+                    result.returncode,
+                    (result.stderr or "").strip()[:200],
+                )
+        except Exception as e:
+            logging.warning("nvidia-smi uuid query failed: %s", e)
+    logging.info(f"host={socket.gethostname()} gpus={gpus} uuids={uuids}")
+
+
+def _signal_process_group(pgid: int, signum: int, reason: str) -> bool:
+    try:
+        os.killpg(pgid, signum)
+        logging.warning(
+            "%s: sent %s to test process group %s",
+            reason,
+            signal.Signals(signum).name,
+            pgid,
+        )
+        return True
+    except ProcessLookupError:
+        logging.info("%s: test process group %s already gone", reason, pgid)
+        return False
+    except OSError as e:
+        logging.warning("%s: cannot signal test process group %s: %s", reason, pgid, e)
+        return False
+
+
+def _process_group_exists(pgid: int) -> bool:
+    """Whether the test process group still has any member."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # EPERM: the group exists, we just may not signal it.
+        return True
+
+
+def _wait_for_group_exit(proc, pgid: int, timeout: float) -> bool:
+    """Wait until the test process is reaped and its group has no members."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None and not _process_group_exists(pgid):
+            return True
+        time.sleep(_WATCHDOG_POLL_SECONDS)
+    proc.poll()
+    return not _process_group_exists(pgid)
+
+
+def _kill_hung_test(proc, pgid: int, elapsed: int, watchdog: int) -> int:
+    """Kill a hung test group, preserving a stack dump when the test can give one.
+
+    SIGUSR1 first: a test that registered faulthandler (see
+    rtp_llm.test.utils.hang_watchdog) prints every thread's stack, turning "it
+    hung" into "it hung here". SIGKILL follows after a short grace, so the test
+    and everything it spawned cannot outlive the wrapper and keep holding the
+    cards.
+
+    The grace is spent on the group, not just the direct child: SIGUSR1's
+    default disposition can take the direct child down immediately while the
+    workers it spawned are the ones that still have to print their stacks.
+    """
+    _signal_process_group(pgid, signal.SIGUSR1, "watchdog stack dump request")
+    _wait_for_group_exit(proc, pgid, _WATCHDOG_SIGNAL_GRACE_SECONDS)
+    _signal_process_group(pgid, signal.SIGKILL, "watchdog")
+    _wait_for_group_exit(proc, pgid, _WATCHDOG_SIGNAL_GRACE_SECONDS)
+    logging.error(
+        "watchdog: hung test killed by watchdog host=%s gpus=%s elapsed=%ss "
+        "watchdog=%ss",
+        socket.gethostname(),
+        _visible_gpus(),
+        elapsed,
+        watchdog,
+    )
+    return _WATCHDOG_EXIT_CODE
+
+
+def _escalate_forwarded_signal(
+    pgid: int, forwarded_at: Optional[float], grace: float
+) -> bool:
+    """True once a forwarded signal has been escalated to SIGKILL.
+
+    Bazel SIGKILLs the wrapper after its own termination grace; a test that
+    ignores the forwarded signal would be orphaned again, so the group is
+    killed if it has not exited in time.
+    """
+    if forwarded_at is None or time.monotonic() - forwarded_at < grace:
+        return False
+    _signal_process_group(pgid, signal.SIGKILL, "wrapper termination grace expired")
+    return True
+
+
+def _wait_for_test(proc, pgid: int, watchdog: int) -> Optional[int]:
+    """Wait for a test process; None means the watchdog killed it."""
+    forwarded: List[int] = []
+    forwarded_at: Optional[float] = None
+    escalated = False
+
+    def _handle_termination(signum, _frame):
+        nonlocal forwarded_at
+        forwarded.append(signum)
+        if forwarded_at is None:
+            forwarded_at = time.monotonic()
+        _signal_process_group(pgid, signum, "wrapper received signal")
+        if len(forwarded) > 1:
+            _signal_process_group(
+                pgid, signal.SIGKILL, "wrapper received repeated signal"
+            )
+
+    previous_handlers = {
+        sig: signal.signal(sig, _handle_termination)
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+    started = time.monotonic()
+    deadline = started + watchdog if watchdog > 0 else None
+    try:
+        while True:
+            code = proc.poll()
+            if code is not None:
+                if forwarded and not escalated:
+                    # The direct child died from the forwarded signal, but the
+                    # workers/helpers it spawned may still be alive; take the
+                    # whole group down before returning.
+                    _signal_process_group(
+                        pgid, signal.SIGKILL, "wrapper group cleanup after signal"
+                    )
+                break
+            if not escalated:
+                escalated = _escalate_forwarded_signal(
+                    pgid, forwarded_at, _WATCHDOG_SIGNAL_GRACE_SECONDS
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                _kill_hung_test(proc, pgid, int(time.monotonic() - started), watchdog)
+                return None
+            time.sleep(_WATCHDOG_POLL_SECONDS)
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+    if forwarded:
+        logging.warning(
+            "wrapper received signal(s) %s; test exited with code %s", forwarded, code
+        )
+    if code < 0:
+        # Killed by a signal: report the shell convention (128+N) instead of a
+        # negative Python exit status.
+        code = 128 - code
+    return code
+
+
+def _run_test_command() -> int:
+    command = sys.argv[1:]
+    if not _IS_POSIX:
+        # Process groups, killpg and SIGUSR1 are POSIX-only. Keep the legacy
+        # path elsewhere so the wrapper still runs, just without a watchdog.
+        result = subprocess.run(command)
+        logging.info("exitcode: %d", result.returncode)
+        return result.returncode
+
+    _log_test_placement()
+    watchdog = _watchdog_seconds()
+    logging.info(
+        "running test: %s (RTP_TEST_WATCHDOG_SECONDS=%s)",
+        " ".join(command),
+        watchdog if watchdog > 0 else "disabled",
+    )
+    # start_new_session: the test leads its own process group, so the watchdog
+    # can kill the test *and everything it spawned* -- a hung helper process
+    # must not survive the wrapper and keep holding the cards.
+    proc = subprocess.Popen(command, start_new_session=True)
+    code = _wait_for_test(proc, proc.pid, watchdog)
+    if code is None:
+        return _WATCHDOG_EXIT_CODE
+    logging.info("exitcode: %d", code)
+    return code
 
 
 def main():

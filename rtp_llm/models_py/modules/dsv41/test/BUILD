@@ -54,9 +54,18 @@ py_test(
     name = "test_embedding_tp4",
     srcs = ["test_embedding_tp4.py"],
     main = "test_embedding_tp4.py",
-    deps = ["//rtp_llm:testlib", "//rtp_llm/models_py:modules"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm/test/utils:hang_watchdog",
+    ],
+    # Normal runtime is ~27s; this case once sat 4647s in [Sched] and hung
+    # long enough to hold four cards until the job was killed. "moderate"
+    # (300s) bounds a repeat without changing any other target; each worker
+    # also arms hang_watchdog for a stack dump plus exit code 70.
+    timeout = "moderate",
+    env = {"GPU_COUNT": "4", "RTP_TEST_WATCHDOG_SECONDS": "300"},
     tags = ["dsv41_cuda13", "SM100_ARM_CU13"],
-    env = {"GPU_COUNT": "4"},
     exec_properties = {"gpu": "SM100_ARM_CU13", "gpu_count": "4"},
     target_compatible_with = select({
         "@//:using_cuda13_arm": [],
