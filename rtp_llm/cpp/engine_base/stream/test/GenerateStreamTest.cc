@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -907,6 +908,11 @@ TEST_F(GenerateStreamTest, testSpeculativeNextStepLimitUsesGreaterConfiguredAndA
     stream->setReserveStep(4);
     EXPECT_EQ(stream->nextStepSeqLengthLimit(), 2041u);
     EXPECT_EQ(stream->maxTokenNum(), 2048u);
+
+    /** The async reserve can exceed INT_MAX before it saturates the remaining sequence length to zero. */
+    sp_output_buffer->propose_step = std::numeric_limits<int>::max() - 1;
+    EXPECT_EQ(stream->nextStepSeqLengthLimit(), 0u);
+    EXPECT_EQ(stream->maxTokenNum(), 2048u);
 }
 
 TEST_F(GenerateStreamTest, speculativeCommitCrossesNextRoundLimitAndCapsProcessorAndKvAtRequestLimit) {
@@ -972,6 +978,26 @@ TEST_F(GenerateStreamTest, ppCommitClipsToRequestAndModelCaps) {
         stream->update({torch::tensor({{2, 3, 4}}, torch::kInt32), 3}, false);
         EXPECT_EQ(stream->seqLength(), max_new_tokens == 1 ? 2047 : 2048);
         EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+    }
+}
+
+TEST_F(GenerateStreamTest, intMaxRequestCapsCommitLimitAndCommitsOnlyProvidedToken) {
+    autil::EnvGuard stream_async("RTP_LLM_STREAM_ASYNC", "0");
+    const int      int_max = std::numeric_limits<int>::max();
+    for (const int input_length : {1, 3}) {
+        for (const int max_new_tokens : {int_max - input_length, int_max - input_length + 1, int_max}) {
+            SCOPED_TRACE(testing::Message() << "input_length=" << input_length
+                                           << ", max_new_tokens=" << max_new_tokens);
+            auto stream = GenerateStreamBuilder().createContextStream(std::vector<int>(input_length, 1));
+            stream->generateConfig()->max_new_tokens = max_new_tokens;
+            ASSERT_EQ(stream->maxTokenNum(), stream->maxSeqLen());
+            ASSERT_EQ(stream->nextStepSeqLengthLimit(), stream->maxSeqLen());
+
+            stream->update({torch::tensor({{4}}, torch::kInt32), 1});
+            ASSERT_TRUE(stream->statusInfo().ok()) << stream->statusInfo().ToString();
+            EXPECT_EQ(stream->seqLength(), input_length + 1);
+            EXPECT_EQ(stream->completeTokenIds()[0][input_length].item<int>(), 4);
+        }
     }
 }
 
