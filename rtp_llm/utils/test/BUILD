@@ -205,6 +205,15 @@ py_test(
 )
 
 py_test(
+    name = "startup_warmup_test",
+    srcs = ["startup_warmup_test.py"],
+    data = [
+        "//rtp_llm:start_server.py",
+        "//rtp_llm:utils/startup_warmup.py",
+    ],
+)
+
+py_test(
     name = "hot_hook_runtime_test",
     srcs = [
         "hot_hook_runtime_test.py",

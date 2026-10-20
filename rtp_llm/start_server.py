@@ -905,6 +905,7 @@ async def _run_startup_real_warmup_grpc(py_env_configs: PyEnvConfigs):
     from rtp_llm.config.generate_config import GenerateConfig
     from rtp_llm.cpp.model_rpc.model_rpc_client import ModelRpcClient
     from rtp_llm.utils.base_model_datatypes import GenerateInput
+    from rtp_llm.utils.startup_warmup import consume_startup_warmup
 
     token_lens = _get_startup_real_warmup_token_lens(py_env_configs)
     max_len = _get_startup_real_warmup_max_len(py_env_configs)
@@ -920,10 +921,9 @@ async def _run_startup_real_warmup_grpc(py_env_configs: PyEnvConfigs):
     )
     logging.info(
         "running startup real warmup via backend grpc, addrs=%s, "
-        "token_lens=%s, token_id=%d, max_new_tokens=%d, reserve_step=%d, timeout=%.1fs",
+        "token_lens=%s, max_new_tokens=%d, reserve_step=%d, timeout=%.1fs",
         addresses,
         token_lens,
-        STARTUP_REAL_WARMUP_TOKEN_ID,
         STARTUP_REAL_WARMUP_MAX_NEW_TOKENS,
         reserve_step,
         timeout_s,
@@ -974,8 +974,6 @@ async def _run_startup_real_warmup_grpc(py_env_configs: PyEnvConfigs):
                 )
 
                 begin = time.time()
-                last_aux = None
-                chunk_count = 0
                 logging.info(
                     "startup grpc warmup request begin, "
                     "addr=%s, request_id=%d, target_token_len=%d, "
@@ -987,40 +985,25 @@ async def _run_startup_real_warmup_grpc(py_env_configs: PyEnvConfigs):
                     max_new_tokens,
                     reserve_step,
                 )
-                async for outputs in client.enqueue(generate_input):
-                    chunk_count += 1
-                    if outputs.generate_outputs:
-                        last_aux = outputs.generate_outputs[0].aux_info
-                if last_aux is not None:
-                    logging.info(
-                        "startup grpc warmup request finished, addr=%s, request_id=%d, "
-                        "target_token_len=%d, request_token_len=%d, max_new_tokens=%d, "
-                        "chunks=%d, input_len=%s, "
-                        "reuse_len=%s, output_len=%s, cost=%.2fs",
-                        addr,
-                        request_id,
-                        token_len,
-                        request_token_len,
-                        max_new_tokens,
-                        chunk_count,
-                        getattr(last_aux, "input_len", None),
-                        getattr(last_aux, "reuse_len", None),
-                        getattr(last_aux, "output_len", None),
-                        time.time() - begin,
-                    )
-                else:
-                    logging.info(
-                        "startup grpc warmup request finished, addr=%s, request_id=%d, "
-                        "target_token_len=%d, request_token_len=%d, max_new_tokens=%d, "
-                        "chunks=%d, aux_info=None, cost=%.2fs",
-                        addr,
-                        request_id,
-                        token_len,
-                        request_token_len,
-                        max_new_tokens,
-                        chunk_count,
-                        time.time() - begin,
-                    )
+                rpc_frame_count, last_aux = await consume_startup_warmup(
+                    client.enqueue(generate_input), request_token_len
+                )
+                logging.info(
+                    "startup grpc warmup request finished, addr=%s, request_id=%d, "
+                    "target_token_len=%d, request_token_len=%d, max_new_tokens=%d, "
+                    "rpc_frames=%d, input_len=%s, "
+                    "reuse_len=%s, output_len=%s, cost=%.2fs",
+                    addr,
+                    request_id,
+                    token_len,
+                    request_token_len,
+                    max_new_tokens,
+                    rpc_frame_count,
+                    last_aux.input_len,
+                    last_aux.reuse_len,
+                    last_aux.output_len,
+                    time.time() - begin,
+                )
         finally:
             try:
                 await client.close()
