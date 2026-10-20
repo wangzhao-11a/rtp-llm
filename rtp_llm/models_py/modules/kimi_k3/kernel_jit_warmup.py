@@ -138,6 +138,10 @@ def warmup_kimi_k3_kernel_jit(model, init_resource) -> None:
     from rtp_llm.models_py.modules.kimi_k3.mla_jit_warmup import (
         warmup_kimi_k3_mla_jit,
     )
+    from rtp_llm.models_py.modules.kimi_k3.bounded_projection_jit_warmup import (
+        warmup_kimi_k3_projection_jit,
+    )
 
+    warmup_kimi_k3_projection_jit(model, init_resource)
     warmup_kimi_k3_mla_jit(model, init_resource)
     _warmup_replay(model, init_resource)
