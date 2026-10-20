@@ -100,9 +100,10 @@ cc_test(
         "//rtp_llm/cpp/cache:cache_config",
         "//rtp_llm/cpp/cache:kv_cache_specs",
         "//rtp_llm/cpp/cache:pp_topology_validator",
+        "//rtp_llm/models_py/bindings/core:exec_ops_test_lib",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-    ],
+    ] + torch_deps() + cuda13_torch_link_deps,
     env = {},
 )
 

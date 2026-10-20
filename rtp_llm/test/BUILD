@@ -493,4 +493,6 @@ py_test(
         "//rtp_llm:sdk",
         "//rtp_llm:testlib",
     ],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
