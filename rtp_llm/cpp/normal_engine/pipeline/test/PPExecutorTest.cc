@@ -341,10 +341,11 @@ private:
 struct WorkState {
     int  waits     = 0;
     int  destroyed = 0;
+    bool completed = false;
     bool fail      = false;
 };
 
-/** Control wait outcomes without sleeping or depending on a distributed backend. */
+/** Controllable completion and failures keep lifetime tests independent of backend timing. */
 class RecordingWork: public P2PWork {
 public:
     explicit RecordingWork(std::shared_ptr<WorkState> state): state_(std::move(state)) {}
@@ -358,6 +359,11 @@ public:
         if (state_->fail) {
             throw std::runtime_error("peer disconnected");
         }
+        state_->completed = true;
+    }
+
+    bool isCompleted() override {
+        return state_->completed;
     }
 
 private:
@@ -383,6 +389,12 @@ public:
         if (ready_) {
             ready_->block(cuda_graph::graphGetCurrentStream());
         }
+        waited_ = true;
+    }
+
+    bool isCompleted() override {
+        /** CUDA copies expose event completion; CPU work mirrors Gloo's wait-driven completion state. */
+        return ready_ ? ready_->query() : waited_;
     }
 
     const torch::Tensor& tensor() const {
@@ -393,6 +405,7 @@ private:
     torch::Tensor                            tensor_;
     std::function<void(const torch::Tensor&)> on_wait_;
     std::optional<torch::Event>               ready_;
+    bool                                     waited_ = false;
 };
 
 class InMemoryPPTransport: public PPTransport {
@@ -1138,33 +1151,98 @@ TEST_F(PPExecutorTest, CommonSlotReuseWaitsForPreviousSendsBeforeForward) {
     }
 }
 
-TEST_F(PPExecutorTest, CommonCommunicationWaitRetainsWorkAndPropagatesFailures) {
-    auto running = std::make_shared<WorkState>();
-    {
-        PPCommTicket running_ticket(std::make_unique<RecordingWork>(running));
-        running_ticket.wait();
-        running_ticket.wait();
-        EXPECT_EQ(running->waits, 2);
-        EXPECT_EQ(running->destroyed, 0);
-    }
-    EXPECT_EQ(running->destroyed, 1);
+TEST_F(PPExecutorTest, CommonActivationSendsReapedAcrossSlotsIncludingSkippedBatches) {
+    for (const bool skip_run : {false, true}) {
+        SCOPED_TRACE(skip_run);
+        auto params = makeStageParams(1);
+        PPExecutor executor(params, nullptr, false);
+        auto* wire  = attachTransport(executor);
+        auto* model = installModel<RecordingStageModel>(executor, params.parallelism_config);
+        auto plan   = makePlan(params);
+        plan.model_input.skip_run = skip_run;
+        enqueuePlan(*wire, plan);
 
-    auto failed = std::make_shared<WorkState>();
-    {
-        failed->fail = true;
-        PPCommTicket failed_ticket(std::make_unique<RecordingWork>(failed));
-        EXPECT_THROW(failed_ticket.wait(), std::runtime_error);
-        EXPECT_EQ(failed->waits, 1);
-        EXPECT_EQ(failed->destroyed, 0);
-        failed->fail = false;
-        EXPECT_NO_THROW(failed_ticket.wait());
-        EXPECT_EQ(failed->waits, 2);
-        EXPECT_EQ(failed->destroyed, 0);
+        std::vector<std::shared_ptr<WorkState>> metadata;
+        std::vector<std::shared_ptr<WorkState>> pending;
+        std::vector<std::shared_ptr<WorkState>> completed;
+        for (size_t slot = 1; slot < executor.slots_.size(); ++slot) {
+            auto& batch = executor.slots_[slot];
+            ASSERT_FALSE(batch.result_pending);
+            metadata.push_back(std::make_shared<WorkState>());
+            pending.push_back(std::make_shared<WorkState>());
+            completed.push_back(std::make_shared<WorkState>());
+            completed.back()->completed = true;
+            /** Pending metadata and payloads must not retain a later completed snapshot. */
+            for (const auto& state : {metadata.back(), pending.back(), completed.back()}) {
+                batch.activation_sends.push_back(
+                    std::make_unique<PPCommTicket>(std::make_unique<RecordingWork>(state)));
+            }
+        }
+
+        const auto expect_reclaimed = [&] {
+            for (size_t i = 0; i < completed.size(); ++i) {
+                EXPECT_EQ(completed[i]->waits, 1);
+                EXPECT_EQ(completed[i]->destroyed, 1);
+                EXPECT_EQ(metadata[i]->waits, 0);
+                EXPECT_EQ(metadata[i]->destroyed, 0);
+                EXPECT_EQ(pending[i]->waits, 0);
+                EXPECT_EQ(pending[i]->destroyed, 0);
+                EXPECT_EQ(executor.slots_[i + 1].activation_sends.size(), 2u);
+            }
+        };
+        model->on_forward = expect_reclaimed;
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        EXPECT_EQ(model->inputs.size(), skip_run ? 0u : 1u);
+        expect_reclaimed();
+
+        for (auto& state : pending) {
+            state->completed = true;
+        }
+        executor.reapCompletedActivationSends();
+        for (size_t i = 0; i < pending.size(); ++i) {
+            EXPECT_EQ(pending[i]->waits, 1);
+            EXPECT_EQ(pending[i]->destroyed, 1);
+            EXPECT_EQ(metadata[i]->waits, 0);
+            EXPECT_EQ(metadata[i]->destroyed, 0);
+            auto& tickets = executor.slots_[i + 1].activation_sends;
+            ASSERT_EQ(tickets.size(), 1u);
+            executor.waitAll(tickets);
+            EXPECT_TRUE(tickets.empty());
+            EXPECT_EQ(metadata[i]->waits, 1);
+            EXPECT_EQ(metadata[i]->destroyed, 1);
+        }
     }
-    EXPECT_EQ(failed->destroyed, 1);
 }
 
-TEST_F(PPExecutorTest, CommonActivationSendSnapshotsBorrowedOutputAndRetainsItAfterWait) {
+TEST_F(PPExecutorTest, CommonActivationReapingPropagatesFailureWithoutDroppingRemainingSends) {
+    auto params = makeStageParams(1);
+    PPExecutor executor(params, nullptr, false);
+    auto pending   = std::make_shared<WorkState>();
+    auto completed = std::make_shared<WorkState>();
+    auto failed    = std::make_shared<WorkState>();
+    auto later     = std::make_shared<WorkState>();
+    completed->completed = true;
+    failed->completed    = true;
+    failed->fail         = true;
+    later->completed     = true;
+    auto& tickets = executor.slots_[1].activation_sends;
+    for (const auto& state : {pending, completed, failed, later}) {
+        tickets.push_back(std::make_unique<PPCommTicket>(std::make_unique<RecordingWork>(state)));
+    }
+
+    EXPECT_THROW(executor.reapCompletedActivationSends(), std::runtime_error);
+    EXPECT_EQ(completed->waits, 1);
+    EXPECT_EQ(completed->destroyed, 1);
+    EXPECT_EQ(failed->waits, 1);
+    EXPECT_EQ(failed->destroyed, 0);
+    EXPECT_EQ(pending->waits, 0);
+    EXPECT_EQ(pending->destroyed, 0);
+    EXPECT_EQ(later->waits, 0);
+    EXPECT_EQ(later->destroyed, 0);
+    EXPECT_EQ(tickets.size(), 3u);
+}
+
+TEST_F(PPExecutorTest, CommonActivationSendKeepsSnapshotUntilReclaimedAndMetadataUntilWait) {
     for (bool noncontiguous : {false, true}) {
         SCOPED_TRACE(noncontiguous);
         auto params = makeStageParams(1);
@@ -1174,7 +1252,7 @@ TEST_F(PPExecutorTest, CommonActivationSendSnapshotsBorrowedOutputAndRetainsItAf
         auto source = noncontiguous ? backing.narrow(1, 0, 2) : backing;
         ASSERT_EQ(source.is_contiguous(), !noncontiguous);
         const auto expected = source.clone();
-        PPTickets tickets;
+        auto& tickets = executor.slots_[0].activation_sends;
         executor.asyncSendTensors({{{"hidden_states", source}}}, tickets);
         ASSERT_EQ(tickets.size(), 3u);
         auto* work = static_cast<InMemoryP2PWork*>(tickets.back()->work_.get());
@@ -1186,25 +1264,40 @@ TEST_F(PPExecutorTest, CommonActivationSendSnapshotsBorrowedOutputAndRetainsItAf
         tickets.back()->wait();
         ASSERT_EQ(tickets.back()->work_.get(), work);
         EXPECT_TRUE(torch::equal(work->tensor(), expected));
+        executor.reapCompletedActivationSends();
+        ASSERT_EQ(tickets.size(), 2u);
         executor.waitAll(tickets);
         EXPECT_TRUE(tickets.empty());
     }
 }
 
-TEST_F(PPExecutorTest, CommonActivationReceiveSubmitsOnReceiveStreamAndWaitsOnComputeStream) {
+TEST_F(PPExecutorTest, CommonActivationReceivesReuseTwoBuffersAcrossForwardsAndSkippedBatches) {
     auto params = makeStageParams(1);
     PPExecutor executor(params, nullptr, false);
-    auto* wire = attachTransport(executor);
-    const auto expected = activations(4);
-    wire->enqueueObject(pp_serialization::serializeTensorsMetadata(expected));
-    wire->received_tensors.push_back(expected.tensors.at("hidden_states").cpu().pin_memory());
+    auto* wire  = attachTransport(executor);
+    auto* model = installModel<RecordingStageModel>(executor, params.parallelism_config);
+    PPExecutionPlan empty;
+    empty.model_input.skip_run = true;
+    const std::vector<PPExecutionPlan> plans{
+        makePlan(params), makePlan(params), empty, makePlan(params, true), makePlan(params, true), makePlan(params)};
+    std::vector<torch::Tensor> expected;
+    for (const auto& plan : plans) {
+        enqueuePlan(*wire, plan);
+        if (!plan.model_input.skip_run) {
+            auto& payload = wire->received_tensors.back();
+            payload.add_(static_cast<int64_t>(expected.size()) * 100);
+            expected.push_back(payload.clone());
+        }
+    }
+
     const auto compute_stream = cuda_graph::graphGetCurrentStream();
-    int receives = 0;
-    int waits = 0;
+    EXPECT_NE(cuda_graph::toGraphStream(executor.recv_stream_), compute_stream);
+    std::vector<torch::Tensor> received;
+    size_t                    waits = 0;
     wire->on_receive = [&](const torch::Tensor& tensor) {
         if (tensor.is_cuda()) {
             EXPECT_EQ(cuda_graph::graphGetCurrentStream(), cuda_graph::toGraphStream(executor.recv_stream_));
-            ++receives;
+            received.push_back(tensor);
         }
     };
     wire->on_wait = [&](const torch::Tensor& tensor) {
@@ -1214,12 +1307,29 @@ TEST_F(PPExecutorTest, CommonActivationReceiveSubmitsOnReceiveStreamAndWaitsOnCo
         }
     };
 
-    const auto received = executor.receiveTensors();
-    EXPECT_EQ(cuda_graph::graphGetCurrentStream(), compute_stream);
-    EXPECT_EQ(receives, 1);
-    EXPECT_EQ(waits, 1);
+    size_t executions = 0;
+    for (const auto& plan : plans) {
+        SCOPED_TRACE(testing::Message() << "executions=" << executions << ", skip_run=" << plan.model_input.skip_run);
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        EXPECT_EQ(cuda_graph::graphGetCurrentStream(), compute_stream);
+        if (!plan.model_input.skip_run) {
+            ++executions;
+        }
+        ASSERT_EQ(received.size(), executions);
+        ASSERT_EQ(model->received_hidden.size(), executions);
+        EXPECT_EQ(waits, executions);
+        EXPECT_EQ(received.back().sizes().vec(), expected[executions - 1].sizes().vec());
+        EXPECT_TRUE(torch::equal(model->received_hidden.back().cpu(), expected[executions - 1]));
+        if (executions >= 2) {
+            EXPECT_NE(received[0].data_ptr(), received[1].data_ptr());
+            EXPECT_TRUE(torch::equal(received[executions - 2].cpu(), expected[executions - 2]));
+        }
+        if (executions >= 3) {
+            EXPECT_EQ(received.back().data_ptr(), received[(executions - 1) % 2].data_ptr());
+            EXPECT_EQ(received.back().storage().nbytes(), received[(executions - 1) % 2].storage().nbytes());
+        }
+    }
     EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
-    EXPECT_TRUE(torch::equal(received.tensors.at("hidden_states"), expected.tensors.at("hidden_states")));
 }
 
 TEST_F(PPExecutorTest, FinishWaitsForEarlierSendsAndPropagatesFailures) {

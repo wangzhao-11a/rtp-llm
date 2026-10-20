@@ -132,6 +132,10 @@ public:
      * completes.
      */
     virtual void wait() = 0;
+
+    /** Query the reported completion state without blocking; completion does not guarantee success.
+     * Depending on the backend, completion may only become observable after wait(). */
+    virtual bool isCompleted() = 0;
 };
 
 enum class P2PBackend {

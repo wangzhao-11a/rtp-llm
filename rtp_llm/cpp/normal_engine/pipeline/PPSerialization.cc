@@ -452,7 +452,7 @@ torch::Tensor serializeTensorsMetadata(const PPIntermediateTensors& tensors) {
     return w.finish();
 }
 
-PPIntermediateTensors deserializeTensorsMetadata(const torch::Tensor& metadata) {
+PPIntermediateTensors deserializeTensorsMetadata(const torch::Tensor& metadata, PPIntermediateTensors& backing_buffers) {
     ByteReader r(metadata);
     RTP_LLM_CHECK_WITH_INFO(r.val<uint32_t>() == kVersion, "PP tensors-metadata payload version mismatch");
     PPIntermediateTensors out;
@@ -466,16 +466,21 @@ PPIntermediateTensors deserializeTensorsMetadata(const torch::Tensor& metadata) 
         const auto ndim = r.val<uint8_t>();
         RTP_LLM_CHECK_WITH_INFO(ndim <= 8, "PP intermediate tensor ndim=%u out of range", ndim);
         std::vector<int64_t> sizes(ndim);
+        int64_t             numel = 1;
         for (size_t d = 0; d < ndim; ++d) {
             sizes[d] = r.val<int64_t>();
             RTP_LLM_CHECK_WITH_INFO(sizes[d] >= 0, "PP intermediate tensor has negative dim");
+            numel *= sizes[d];
         }
         const auto dtype   = static_cast<torch::ScalarType>(r.val<int32_t>());
         const bool is_cuda = r.flag();
-        /** Pre-allocate so the transport can receive the payload in place. */
-        out.tensors.emplace(
-            std::move(name),
-            torch::empty(sizes, torch::TensorOptions().dtype(dtype).device(is_cuda ? torch::kCUDA : torch::kCPU)));
+        /** Batch token counts vary while tensor fields and types stay fixed for a stage boundary.
+         * Reusable capacity avoids per-batch allocations; views retain the received shapes. */
+        auto& buffer = backing_buffers.tensors[name];
+        if (!buffer.defined() || buffer.numel() < numel) {
+            buffer = torch::empty({numel}, torch::TensorOptions().dtype(dtype).device(is_cuda ? torch::kCUDA : torch::kCPU));
+        }
+        out.tensors.emplace(std::move(name), buffer.narrow(0, 0, numel).view(sizes));
     }
     r.expectEnd();
     return out;

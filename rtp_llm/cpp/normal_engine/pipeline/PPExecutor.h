@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <functional>
 #include <list>
 #include <memory>
@@ -186,6 +187,8 @@ private:
 
     void waitAll(PPTickets& tickets);
 
+    void reapCompletedActivationSends();
+
     bool isFirstStage() const {
         return pp_layout_.hasEmbedding();
     }
@@ -261,8 +264,15 @@ private:
     /** Covers the last execution's model-buffer consumers, including outgoing activation copies. */
     torch::Event last_compute_done_ = cuda_graph::makeGraphEvent();
 
-    /** Submit receives independently so NCCL does not wait for the previous forward. */
-    torch::Stream recv_stream_;
+    /**
+     * Receiving on the compute stream would make NCCL wait for the previous forward. A dedicated receive
+     * stream enables overlap, while two persistent buffers protect active inputs and avoid per-batch
+     * allocations once capacity is sufficient. Reuse relies on the intervening batch's waitLastRun()
+     * completing prior readers and outgoing activation copies.
+     */
+    std::array<PPIntermediateTensors, 2> recv_buffers_;
+    size_t                              next_recv_buffer_ = 0;
+    torch::Stream                       recv_stream_;
 
     /** Match MTP publication completion on the DSpARK P tail, which owns the draft COMMIT. */
     const bool    track_dspark_cache_store_;

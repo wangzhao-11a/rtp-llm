@@ -198,7 +198,7 @@ PPIntermediateTensors PPExecutor::receiveTensors() {
     PPIntermediateTensors tensors;
     {
         cuda_graph::GraphStreamGuard stream_guard(cuda_graph::toGraphStream(recv_stream_));
-        tensors = pp_serialization::deserializeTensorsMetadata(receiveObject());
+        tensors = pp_serialization::deserializeTensorsMetadata(receiveObject(), recv_buffers_[next_recv_buffer_]);
         for (auto& tensor_entry : tensors.tensors) {
             if (tensor_entry.second.numel() != 0) {
                 tickets.push_back(transport_->asyncReceive(tensor_entry.second));
@@ -214,6 +214,7 @@ PPIntermediateTensors PPExecutor::receiveTensors() {
             tensor_entry.second.record_stream(stream);
         }
     }
+    next_recv_buffer_ = (next_recv_buffer_ + 1) % recv_buffers_.size();
     return tensors;
 }
 
@@ -222,6 +223,21 @@ void PPExecutor::waitAll(PPTickets& tickets) {
         ticket->wait();
     }
     tickets.clear();
+}
+
+void PPExecutor::reapCompletedActivationSends() {
+    for (auto& slot : slots_) {
+        auto& tickets = slot.activation_sends;
+        /** Gloo metadata stays pending until waitAll(); independent ticket reclamation avoids retaining completed
+         * NCCL snapshots until slot reuse. */
+        for (auto it = tickets.begin(); it != tickets.end();) {
+            if ((*it)->tryComplete()) {
+                it = tickets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 }
 
 absl::Status PPExecutor::processExecutionResult(InflightBatch& batch) {
@@ -1335,6 +1351,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
     /** 5. run the batch. */
     if (model_input.skip_run) {
         waitLastRun();
+        reapCompletedActivationSends();
         releaseAllModelBuffers();
     } else {
         if (profile_step_start_) {
@@ -1354,6 +1371,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
             waitLastRun();
             executor_collector.last_run_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         }
+        reapCompletedActivationSends();
         releaseAllModelBuffers();
 
         if (cache_manager_) {

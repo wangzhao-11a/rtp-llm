@@ -251,7 +251,8 @@ TEST_F(PPSerializationTest, PreviousProtocolVersionIsRejectedForEveryMessageType
 
     auto metadata = pp_serialization::serializeTensorsMetadata(PPIntermediateTensors{});
     std::memcpy(metadata.data_ptr(), &old_version, sizeof(old_version));
-    EXPECT_THROW(pp_serialization::deserializeTensorsMetadata(metadata), RTPException);
+    PPIntermediateTensors backing_buffers;
+    EXPECT_THROW(pp_serialization::deserializeTensorsMetadata(metadata, backing_buffers), RTPException);
 }
 
 TEST_F(PPSerializationTest, PlanPreservesScalarEmptyAndOptionalTensorStates) {
@@ -287,21 +288,77 @@ TEST_F(PPSerializationTest, IntermediateMetadataPreservesReceiveDevicesAndEmptyS
     tensors.tensors.emplace("host", torch::empty({2, 3}, torch::kFloat32));
     tensors.tensors.emplace(
         "device", torch::empty({4}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA)));
+    tensors.tensors.emplace("scalar", torch::tensor(1.0f));
     tensors.tensors.emplace("empty", torch::empty({0}, torch::kInt32));
     tensors.tensors.emplace("undefined", torch::Tensor{});
 
-    const auto received =
-        pp_serialization::deserializeTensorsMetadata(pp_serialization::serializeTensorsMetadata(tensors));
+    PPIntermediateTensors backing_buffers;
+    const auto received = pp_serialization::deserializeTensorsMetadata(
+        pp_serialization::serializeTensorsMetadata(tensors), backing_buffers);
     ASSERT_EQ(received.tensors.size(), tensors.tensors.size());
-    for (const auto& name : {"host", "device"}) {
+    for (const auto& name : {"host", "device", "scalar"}) {
         const auto& source = tensors.tensors.at(name);
         const auto& buffer = received.tensors.at(name);
         EXPECT_EQ(buffer.device(), source.device());
         EXPECT_EQ(buffer.scalar_type(), source.scalar_type());
         EXPECT_EQ(buffer.sizes().vec(), source.sizes().vec());
+        EXPECT_EQ(buffer.data_ptr(), backing_buffers.tensors.at(name).data_ptr());
     }
     EXPECT_FALSE(received.tensors.at("empty").defined());
     EXPECT_FALSE(received.tensors.at("undefined").defined());
+    EXPECT_EQ(backing_buffers.tensors.count("empty"), 0u);
+    EXPECT_EQ(backing_buffers.tensors.count("undefined"), 0u);
+}
+
+TEST_F(PPSerializationTest, IntermediateReceiveStorageGrowsOnlyWhenCapacityIsInsufficient) {
+    for (const auto device : {torch::kCPU, torch::kCUDA}) {
+        SCOPED_TRACE(device);
+        const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        PPIntermediateTensors backing_buffers;
+        const auto decode = [&](int64_t rows) {
+            PPIntermediateTensors tensors;
+            tensors.tensors.emplace("hidden_states", torch::empty({rows, 4}, options));
+            tensors.tensors.emplace("aux_hidden_states", torch::empty({rows, 8}, options));
+            return pp_serialization::deserializeTensorsMetadata(
+                pp_serialization::serializeTensorsMetadata(tensors), backing_buffers);
+        };
+
+        auto initial = decode(4);
+        for (auto& entry : initial.tensors) {
+            entry.second.fill_(-1);
+        }
+        auto smaller = decode(2);
+        for (const auto& name : {"hidden_states", "aux_hidden_states"}) {
+            const auto& original = initial.tensors.at(name);
+            const auto& view     = smaller.tensors.at(name);
+            EXPECT_EQ(view.sizes().vec(), (std::vector<int64_t>{2, original.size(1)}));
+            EXPECT_EQ(view.data_ptr(), original.data_ptr());
+            EXPECT_EQ(view.data_ptr(), backing_buffers.tensors.at(name).data_ptr());
+            EXPECT_EQ(backing_buffers.tensors.at(name).numel(), original.numel());
+            view.fill_(7);
+            EXPECT_TRUE(torch::equal(original.narrow(0, 0, 2), torch::full_like(view, 7)));
+            EXPECT_TRUE(torch::equal(original.narrow(0, 2, 2), torch::full_like(view, -1)));
+        }
+
+        auto grown = decode(9);
+        for (const auto& name : {"hidden_states", "aux_hidden_states"}) {
+            const auto& view = grown.tensors.at(name);
+            EXPECT_EQ(view.sizes().vec(), (std::vector<int64_t>{9, initial.tensors.at(name).size(1)}));
+            EXPECT_NE(view.data_ptr(), initial.tensors.at(name).data_ptr());
+            EXPECT_EQ(view.data_ptr(), backing_buffers.tensors.at(name).data_ptr());
+            EXPECT_GE(backing_buffers.tensors.at(name).numel(), view.numel());
+        }
+        for (const int64_t rows : {3, 9}) {
+            SCOPED_TRACE(rows);
+            const auto received = decode(rows);
+            for (const auto& name : {"hidden_states", "aux_hidden_states"}) {
+                const auto& view = received.tensors.at(name);
+                EXPECT_EQ(view.sizes().vec(), (std::vector<int64_t>{rows, grown.tensors.at(name).size(1)}));
+                EXPECT_EQ(view.data_ptr(), grown.tensors.at(name).data_ptr());
+                EXPECT_EQ(view.storage().nbytes(), grown.tensors.at(name).storage().nbytes());
+            }
+        }
+    }
 }
 
 TEST_F(PPSerializationTest, MixedReturnSequencesPlanAndResultRoundTrip) {

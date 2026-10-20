@@ -13,8 +13,10 @@ PPExecutionPlan deserializePlan(const torch::Tensor& buffer);
 torch::Tensor     serializeExecutionResult(const PPExecutionResult& result);
 PPExecutionResult deserializeExecutionResult(const torch::Tensor& buffer);
 
-/** Metadata decoding allocates CPU/CUDA receive buffers; tensor data is transferred separately. */
-torch::Tensor         serializeTensorsMetadata(const PPIntermediateTensors& tensors);
-PPIntermediateTensors deserializeTensorsMetadata(const torch::Tensor& metadata);
+torch::Tensor serializeTensorsMetadata(const PPIntermediateTensors& tensors);
+
+/** Decode metadata into receive views backed by reusable storage for a fixed stage boundary.
+ * Previous consumers must finish before the storage is reused. */
+PPIntermediateTensors deserializeTensorsMetadata(const torch::Tensor& metadata, PPIntermediateTensors& backing_buffers);
 
 }  // namespace rtp_llm::pp_serialization

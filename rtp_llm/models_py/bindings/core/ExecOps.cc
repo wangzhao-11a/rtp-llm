@@ -13,6 +13,7 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 #include "autil/StackTracer.h"
 #include "autil/EnvUtil.h"
+#include <ATen/record_function.h>
 #include <algorithm>
 #include <cstdint>
 #include <unistd.h>
@@ -718,12 +719,15 @@ public:
 
     void wait() override {
         py::gil_scoped_acquire gil;
-        if (!work_) {
-            return;
-        }
         /** PyTorch's CUDA caching allocator delays memory reuse until NCCL communication completes. */
-        const bool wait_succeeded = work_.attr("wait")().cast<bool>();
-        RTP_LLM_CHECK_WITH_INFO(wait_succeeded, "P2P work wait failed");
+        work_.attr("wait")();
+    }
+
+    bool isCompleted() override {
+        py::gil_scoped_acquire gil;
+        /** NCCL reports GPU completion or an error; wait() is needed to distinguish success.
+         * Gloo P2P updates its completion state only through wait(), so polling cannot replace its cleanup wait. */
+        return work_.attr("is_completed")().cast<bool>();
     }
 
 private:
@@ -746,9 +750,14 @@ std::unique_ptr<P2PWork> runP2PCallback(const torch::Tensor& tensor,
     }
     RTP_LLM_CHECK_WITH_INFO(
         static_cast<bool>(fn), "%s called but its callback is not registered via register_pp_ops", callback_name);
-    py::object work = fn(tensor, global_peer, static_cast<int>(backend));
-    RTP_LLM_CHECK_WITH_INFO(!work.is_none(), "%s callback returned None", callback_name);
-    RTP_LLM_CHECK_WITH_INFO(py::hasattr(work, "wait"), "%s callback returned an object without wait()", callback_name);
+    py::object work;
+    if (backend == P2PBackend::GLOO) {
+        /** Disable recording to prevent deferred Gloo wait() callbacks from accessing expired profiler storage. */
+        at::DisableRecordFunctionGuard record_guard;
+        work = fn(tensor, global_peer, static_cast<int>(backend));
+    } else {
+        work = fn(tensor, global_peer, static_cast<int>(backend));
+    }
     return std::make_unique<PythonP2PWork>(std::move(work), tensor);
 }
 }  // anonymous namespace

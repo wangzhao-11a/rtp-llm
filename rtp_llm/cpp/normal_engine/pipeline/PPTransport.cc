@@ -7,14 +7,21 @@
 
 namespace rtp_llm {
 
-PPCommTicket::PPCommTicket(std::unique_ptr<P2PWork> work): work_(std::move(work)) {
-    RTP_LLM_CHECK_WITH_INFO(work_ != nullptr, "PPCommTicket requires non-null P2P work");
-}
+PPCommTicket::PPCommTicket(std::unique_ptr<P2PWork> work): work_(std::move(work)) {}
 
 PPCommTicket::~PPCommTicket() = default;
 
 void PPCommTicket::wait() {
     work_->wait();
+}
+
+bool PPCommTicket::tryComplete() {
+    if (!work_->isCompleted()) {
+        return false;
+    }
+    /** A completed work state may include errors; wait() validates success before the ticket can be released. */
+    work_->wait();
+    return true;
 }
 
 TorchDistributedPPTransport::TorchDistributedPPTransport(int64_t previous_rank, int64_t next_rank):

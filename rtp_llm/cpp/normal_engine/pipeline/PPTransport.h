@@ -21,6 +21,9 @@ public:
      */
     void wait();
 
+    /** Check without blocking whether the ticket can be released; completion errors propagate as exceptions. */
+    bool tryComplete();
+
 private:
     std::unique_ptr<P2PWork> work_;
 };
