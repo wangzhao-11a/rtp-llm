@@ -935,6 +935,25 @@ TEST_F(PPExecutorTest, CommonRejectsTorchSpecCaptureBeforeModelConstruction) {
     }
 }
 
+TEST_F(PPExecutorTest, CommonRejectsBatchDecodeSchedulerWithOrWithoutWarmup) {
+    for (int stage : {0, 1, 2}) {
+        for (bool warm_up : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "stage=" << stage << ", warm_up=" << warm_up);
+            auto params = makeStageParams(stage);
+            params.runtime_config.warm_up = warm_up;
+            params.runtime_config.use_batch_decode_scheduler = true;
+            try {
+                PPExecutor executor(params, nullptr, warm_up);
+                FAIL() << "PP accepted use_batch_decode_scheduler";
+            } catch (const std::runtime_error& error) {
+                EXPECT_NE(std::string(error.what()).find("does not support use_batch_decode_scheduler"),
+                          std::string::npos)
+                    << error.what();
+            }
+        }
+    }
+}
+
 TEST_F(PPExecutorTest, CommonBuildsOnlyTheFirstConfiguredDraftModule) {
     auto params                            = makeMtpParams(2);
     params.parallelism_config.pp_rank      = 1;
@@ -975,7 +994,7 @@ TEST_F(PPExecutorTest, CommonActiveCpAllowsOrdinaryDecodeWithReplicatedKv) {
                         FAIL() << "active CP accepted speculative or KV-sharded decode";
                     } catch (const std::runtime_error& error) {
                         EXPECT_NE(std::string(error.what()).find(
-                                      "PP speculative or KV-sharded context parallel execution requires the PREFILL role"),
+                                      "pipeline parallelism with active CP requires the PREFILL role"),
                                   std::string::npos);
                     }
                 }

@@ -260,18 +260,24 @@ absl::Status PPExecutor::processExecutionResult(InflightBatch& batch) {
 void PPExecutor::validateConfig(const EngineInitParams& params) {
     const auto& parallelism_config = params.parallelism_config;
     RTP_LLM_CHECK_WITH_INFO(parallelism_config.pp_size > 1, "PPExecutor requires pp_size > 1");
+#if !USING_CUDA
+    RTP_LLM_FAIL("pipeline parallelism requires a CUDA build; set PP_SIZE=1 on non-CUDA platforms");
+#endif
+    RTP_LLM_CHECK_WITH_INFO(!params.runtime_config.use_batch_decode_scheduler,
+                            "pipeline parallelism does not support use_batch_decode_scheduler; "
+                            "disable USE_BATCH_DECODE_SCHEDULER or set PP_SIZE=1");
     RTP_LLM_CHECK_WITH_INFO(params.model_config_.hidden_state_capture_layer_ids.empty(),
                             "pipeline parallelism does not support TorchSpec hidden-state capture "
                             "(hidden_state_capture_layer_ids)");
 
     const char* stream_async = std::getenv("RTP_LLM_STREAM_ASYNC");
     RTP_LLM_CHECK_WITH_INFO(stream_async == nullptr || std::strcmp(stream_async, "1") != 0,
-                            "pipeline parallelism does not support async runner (RTP_LLM_STREAM_ASYNC)");
+                            "pipeline parallelism does not support RTP_LLM_STREAM_ASYNC=1");
     const char* device_input = std::getenv("RTP_LLM_DEVICE_INPUT");
     RTP_LLM_CHECK_WITH_INFO(device_input == nullptr || std::strcmp(device_input, "1") != 0,
-                            "pipeline parallelism does not support device-input mode (RTP_LLM_DEVICE_INPUT)");
+                            "pipeline parallelism does not support RTP_LLM_DEVICE_INPUT=1");
     RTP_LLM_CHECK_WITH_INFO(params.device_resource_config.enable_layer_micro_batch == 0,
-                            "pipeline parallelism does not support layer micro-batching");
+                            "pipeline parallelism does not support layer micro-batching (enable_layer_micro_batch)");
 
     RTP_LLM_CHECK_WITH_INFO(!params.ffn_disaggregate_config.enable_ffn_disaggregate,
                             "pipeline parallelism does not support FFN disaggregation");
@@ -285,8 +291,8 @@ void PPExecutor::validateConfig(const EngineInitParams& params) {
     const bool  sp_enabled = params.sp_config.type != SP_TYPE_NONE;
     RTP_LLM_CHECK_WITH_INFO(!cp_config.is_enabled() || params.pd_sep_config.role_type == RoleType::PREFILL
                                 || (!sp_enabled && !(cp_config.kv_cache_sharded && parallelism_config.tp_size > 1)),
-                            "PP speculative or KV-sharded context parallel execution requires the PREFILL role; "
-                            "DECODE imports CP KV with cp_rotate_method=PREFILL_CP");
+                            "pipeline parallelism with active CP requires the PREFILL role for speculative decoding "
+                            "or KV sharding with tp_size > 1");
 
     RTP_LLM_CHECK_WITH_INFO(params.sp_config.type == SP_TYPE_NONE || params.sp_config.type == SP_TYPE_MTP
                                 || params.sp_config.type == SP_TYPE_EAGLE || params.sp_config.type == SP_TYPE_DSPARK,
@@ -295,13 +301,7 @@ void PPExecutor::validateConfig(const EngineInitParams& params) {
                             "PP speculative decoding requires a positive gen_num_per_cycle, got %ld",
                             params.sp_config.gen_num_per_cycle);
     RTP_LLM_CHECK_WITH_INFO(!params.kv_cache_config.enable_remote_cache,
-                            "pipeline parallelism does not support the remote KV cache tier: KVCM location specs "
-                            "are keyed by tp_rank alone and its deployment identity carries no pp_size, so only "
-                            "the first stage's layers would reach the remote tier");
-
-#if USING_ROCM
-    RTP_LLM_FAIL("pipeline parallelism is not validated on ROCm");
-#endif
+                            "pipeline parallelism does not support enable_remote_cache");
 }
 
 PPExecutor::PPExecutor(const EngineInitParams&                params,
