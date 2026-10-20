@@ -43,11 +43,12 @@ PPBatchStreamProcessor::PPBatchStreamProcessor(const ModelConfig&               
                                                const PDSepConfig&                 pd_sep_config,
                                                const ProfilingDebugLoggingConfig& profiling_debug_logging_config,
                                                const CacheConfig&                 cache_config,
-                                               bool                               warm_up,
-                                               SpeculativeType                    sp_type):
+                                               const SpeculativeExecutionConfig&  sp_config,
+                                               bool                               warm_up):
     NormalBatchStreamProcessor(model_config, pd_sep_config, profiling_debug_logging_config, cache_config, warm_up),
-    sp_enabled_(sp_type != SP_TYPE_NONE),
-    is_dspark_(sp_type == SP_TYPE_DSPARK),
+    sp_enabled_(sp_config.type != SP_TYPE_NONE),
+    is_dspark_(sp_config.type == SP_TYPE_DSPARK),
+    propose_step_(sp_config.gen_num_per_cycle),
     output_vocab_ids_(model_config.output_vocab_ids),
     processor_eos_token_id_(getProcessorEosTokenId(model_config)) {}
 
@@ -106,11 +107,8 @@ PPSamplingPlan PPBatchStreamProcessor::gatherSamplingPlan(const StreamGroups& st
     auto* do_sample            = sampling_plan.do_sample.data_ptr<bool>();
     auto* finished_mask        = sampling_plan.finished_mask.data_ptr<bool>();
 
-    std::vector<torch::Tensor> draft_all_probs(stream_count);
-    std::vector<int64_t>       draft_point_mass_rows;
-    torch::Tensor             draft_probs_template;
-    size_t                    stream_idx = 0;
-    size_t                    batch_idx  = 0;
+    size_t stream_idx = 0;
+    size_t batch_idx  = 0;
     for (const auto& stream : all_streams) {
         auto& config = *stream->generateConfig();
         sampling_plan.random_seeds.push_back(config.random_seed);
@@ -119,30 +117,6 @@ PPSamplingPlan PPBatchStreamProcessor::gatherSamplingPlan(const StreamGroups& st
             sampling_plan.spec_do_sample.data_ptr<bool>()[stream_idx]  = config.stochastic();
             sampling_plan.force_sp_accept.data_ptr<bool>()[stream_idx] = stream->forceSpAccept();
         }
-        if (is_dspark_) {
-            const auto& sp_output = stream->getSPOutputBuffer();
-            if (sp_output && sp_output->all_probs.defined()) {
-                const auto& probabilities = sp_output->all_probs;
-                const auto  draft_tokens  = sp_output->draftTokens();
-                RTP_LLM_CHECK_WITH_INFO(probabilities.device().is_cpu()
-                                            && probabilities.scalar_type() == torch::kFloat32
-                                            && probabilities.is_contiguous() && probabilities.dim() == 2
-                                            && draft_tokens.defined()
-                                            && probabilities.size(0) == draft_tokens.numel(),
-                                        "PP DSpARK stream probabilities must be contiguous CPU FP32 [K,V] and match "
-                                        "the K draft tokens");
-                if (draft_probs_template.defined()) {
-                    RTP_LLM_CHECK_WITH_INFO(probabilities.sizes() == draft_probs_template.sizes(),
-                                            "PP DSpARK stream probability shapes must match within one batch");
-                } else {
-                    draft_probs_template = probabilities;
-                }
-                draft_all_probs[stream_idx] = probabilities;
-            } else {
-                draft_point_mass_rows.push_back(static_cast<int64_t>(stream_idx));
-            }
-        }
-
         RequestLogitsProcessorConfig processor_config;
         if (config.json_schema.has_value()) {
             processor_config.grammar_type  = "json";
@@ -198,29 +172,6 @@ PPSamplingPlan PPBatchStreamProcessor::gatherSamplingPlan(const StreamGroups& st
         ++stream_idx;
     }
 
-    if (draft_probs_template.defined()) {
-        if (draft_point_mass_rows.empty()) {
-            sampling_plan.draft_all_probs = torch::stack(draft_all_probs).contiguous();
-        } else {
-            /** Preserve each sampled q even when handoff candidates share the batch. Keep row order
-             * and zero-fill missing q here; their one-hot belongs in target vocab after d2t mapping,
-             * since a fixed handoff token need not exist in the reduced draft vocabulary. */
-            sampling_plan.draft_all_probs = torch::zeros({static_cast<int64_t>(stream_count),
-                                                         draft_probs_template.size(0),
-                                                         draft_probs_template.size(1)},
-                                                        draft_probs_template.options());
-            for (size_t row = 0; row < stream_count; ++row) {
-                if (draft_all_probs[row].defined()) {
-                    sampling_plan.draft_all_probs[row].copy_(draft_all_probs[row]);
-                }
-            }
-            sampling_plan.draft_point_mass_rows =
-                torch::empty({static_cast<int64_t>(draft_point_mass_rows.size())}, pinned_i64);
-            std::copy(draft_point_mass_rows.begin(),
-                      draft_point_mass_rows.end(),
-                      sampling_plan.draft_point_mass_rows.data_ptr<int64_t>());
-        }
-    }
     return sampling_plan;
 }
 
@@ -254,15 +205,49 @@ PPOutputConfig PPBatchStreamProcessor::gatherOutputConfig(const StreamGroups& st
     return output_config;
 }
 
-void PPBatchStreamProcessor::initSamplingStates(const PPSamplingPlan& sampling_plan,
-                                               SamplingStates&       sampling_states,
-                                               PPExecutionResult&    result) const {
-    const auto  stream_count = sampling_plan.request_ids.size(0);
-    const auto* request_ids  = sampling_plan.request_ids.data_ptr<int64_t>();
+void PPBatchStreamProcessor::prepareSampling(const PPExecutionPlan&                            plan,
+                                             const std::unordered_map<int64_t, torch::Tensor>& dspark_q,
+                                             const torch::Tensor&                              d2t_map,
+                                             SamplingStates&                                   sampling_states,
+                                             PPExecutionResult&                                result,
+                                             SamplerOutput&                                    draft_sampler_output,
+                                             speculative::SpeculativeSamplingParams&           verify_params) {
+    const auto& sampling_plan = plan.sampling_plan;
+    const auto  stream_count  = sampling_plan.request_ids.size(0);
+    const auto* request_ids   = sampling_plan.request_ids.data_ptr<int64_t>();
+    const bool  is_verify     = sp_enabled_ && plan.model_input.is_target_verify;
+
+    if (is_verify) {
+        /** Exclude the committed anchor from proposal verification. */
+        draft_sampler_output.token_ids =
+            plan.model_input.combo_tokens.reshape({stream_count, propose_step_ + 1}).slice(1, 1).contiguous();
+        draft_sampler_output.token_ids_are_point_mass = !is_dspark_;
+        draft_sampler_output.all_probs                = torch::Tensor();
+
+        verify_params.do_sample    = sampling_plan.spec_do_sample;
+        verify_params.force_accept = sampling_plan.force_sp_accept;
+        verify_params.generators.clear();
+        verify_params.generators.reserve(stream_count);
+
+        if (is_dspark_) {
+            const int64_t target_vocab_size = model_input_gatherer_config_.vocab_size;
+            if (!dspark_verify_q_buffer_.defined() || dspark_verify_q_buffer_.size(0) < stream_count) {
+                dspark_verify_q_buffer_ =
+                    torch::empty({stream_count, propose_step_, target_vocab_size},
+                                 torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+            }
+            draft_sampler_output.all_probs = dspark_verify_q_buffer_.narrow(0, 0, stream_count);
+            draft_sampler_output.all_probs.zero_();
+        }
+    }
+
     int64_t sequence_offset = 0;
     for (int64_t stream_idx = 0; stream_idx < stream_count; ++stream_idx) {
         const auto stream_sequence_count = std::max<int32_t>(sampling_plan.num_return_sequences[stream_idx], 1);
-        if (sampling_states.find(request_ids[stream_idx]) == sampling_states.end()) {
+        int64_t    req_id                = request_ids[stream_idx];
+        auto       state_it              = sampling_states.find(req_id);
+        const bool new_request           = state_it == sampling_states.end();
+        if (new_request) {
             SamplingState state;
             state.cum_log_probs = torch::zeros({stream_sequence_count}, torch::kFloat32);
             if (sampling_plan.random_seeds[stream_idx].has_value()) {
@@ -278,15 +263,44 @@ void PPBatchStreamProcessor::initSamplingStates(const PPSamplingPlan& sampling_p
             if (error.has_value()) {
                 RTP_LLM_LOG_ERROR("PP tail processor initialization failed after stream initialization: "
                                   "request_id=%ld, error_code=%d, error=%s",
-                                  request_ids[stream_idx],
+                                  req_id,
                                   static_cast<int>(error->code()),
                                   error->ToString().c_str());
                 state.logits_processors.clear();
                 result.request_errors[stream_idx] = std::move(error.value());
             }
-            sampling_states.emplace(request_ids[stream_idx], std::move(state));
+            state_it = sampling_states.emplace(req_id, std::move(state)).first;
         }
         sequence_offset += stream_sequence_count;
+
+        if (!is_verify) {
+            continue;
+        }
+        verify_params.generators.push_back(state_it->second.generator);
+
+        if (!is_dspark_) {
+            continue;
+        }
+        auto q_row = draft_sampler_output.all_probs[stream_idx];
+        if (new_request) {
+            /** PPScheduler's zero-padded handoff candidates require Q = delta(0). */
+            q_row.select(1, 0).fill_(1.0f);
+            continue;
+        }
+
+        const auto q_it = dspark_q.find(req_id);
+        if (q_it == dspark_q.end()) {
+            /** Keep the zero row as a placeholder; request_errors prevents its result from being committed. */
+            result.request_errors[stream_idx] =
+                ErrorInfo(ErrorCode::UNKNOWN_ERROR,
+                          "missing PP DSpARK proposal probabilities, request_id=" + std::to_string(req_id));
+            continue;
+        }
+        if (d2t_map.defined()) {
+            q_row.index_copy_(1, d2t_map, q_it->second);
+        } else {
+            q_row.copy_(q_it->second);
+        }
     }
 }
 
@@ -921,9 +935,8 @@ absl::Status PPBatchStreamProcessor::dispatchSpeculativeExecutionResult(const St
         stream_groups.totalModelBatchSize() == all_streams.size() && result.new_token_lengths.device().is_cpu()
             && result.new_token_lengths.numel() == batch_size,
         "PP speculative execution result requires one new token count per request");
-    RTP_LLM_CHECK_WITH_INFO(!is_dspark_
-                                || result.propose_token_ids.defined() == result.propose_all_probs.defined(),
-                            "PP DSpARK proposal tokens and probabilities must be present together");
+    RTP_LLM_CHECK_WITH_INFO(!is_dspark_ || !result.propose_all_probs.defined(),
+                            "PP DSpARK proposal probabilities must remain on the last stage");
     RTP_LLM_CHECK_WITH_INFO(is_dspark_ || is_prefill || !result.propose_all_probs.defined(),
                             "ordinary PP decode results use token-only proposals");
 

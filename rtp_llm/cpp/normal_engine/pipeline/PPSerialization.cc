@@ -10,7 +10,7 @@ namespace rtp_llm::pp_serialization {
 namespace {
 
 /** Bump when any payload layout changes; all PP peers must use the same version. */
-constexpr uint32_t kVersion = 22;
+constexpr uint32_t kVersion = 23;
 
 struct ByteWriter {
     std::vector<uint8_t> buf;
@@ -295,8 +295,6 @@ void samplingPlanFields(IO& io, Sampling& s) {
     io.tensor(s.finished_mask);
     io.tensor(s.spec_do_sample);
     io.tensor(s.force_sp_accept);
-    io.tensor(s.draft_all_probs);
-    io.tensor(s.draft_point_mass_rows);
 }
 
 template<typename IO, typename Request>

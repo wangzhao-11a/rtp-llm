@@ -629,8 +629,8 @@ void PrefillRpcServer::remoteGenerate(PrefillGenerateContext& prefill_context) {
 
     auto sp_output_buffer = stream->getSPOutputBuffer();
 
-    /** P and D choose PP independently. Carry the ordinary speculative handoff for
-     * main's non-PP D; a PP D consumes the tokens and rebuilds draft inputs itself. */
+    /** P and D configure PP independently. Include MTP/EAGLE proposal probabilities and draft hidden
+     * in the PD handoff so a non-PP D can verify the candidate and continue multi-step drafting. */
     if (sp_output_buffer && !engine_->isDSpark()) {
         auto all_probs_cpu =
             sp_output_buffer->all_probs.is_cuda() ? sp_output_buffer->all_probs.cpu() : sp_output_buffer->all_probs;

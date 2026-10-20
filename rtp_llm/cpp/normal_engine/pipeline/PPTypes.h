@@ -54,11 +54,6 @@ struct PPSamplingPlan {
     /** CPU bool [stream_count]: stochastic() controls both rejection sampling and DSpARK temperature. */
     torch::Tensor spec_do_sample;
     torch::Tensor force_sp_accept;  // [stream_count]
-    /** Optional DSpARK q: CPU FP32 [stream_count, K, draft_vocab_size]. In mixed batches,
-     * point-mass rows are zero placeholders until the last stage materializes target-vocab one-hot q. */
-    torch::Tensor draft_all_probs;
-    /** CPU int64 row indices within request_ids, defined only for mixed dense/point-mass batches. */
-    torch::Tensor draft_point_mass_rows;
 };
 
 struct PPPromptLogitsRequest {
@@ -119,16 +114,16 @@ struct PPExecutionResult {
     /** First error per request; failed-row placeholders are not committed. */
     std::vector<ErrorInfo> request_errors;
 
-    /** Next-round drafts excluding the anchor: CPU int32 [B, K].
-     * PD prefill: one draft for MTP/EAGLE; undefined for DSpARK. */
-    torch::Tensor propose_token_ids;
-    /** Proposal q paired with propose_token_ids: CPU FP32 [B, K, draft_vocab_size].
-     * Ordinary MTP/EAGLE carries one proposal on PD prefill for a non-PP D consumer;
-     * DSpARK carries its next-round distributions on decode. */
-    torch::Tensor propose_all_probs;
-    /** PD MTP/EAGLE handoff keeps one final draft hidden row per request, CPU [B,H].
-     * This is separate from target hidden requested by the user. */
-    torch::Tensor propose_hidden_states;
+    /**
+     * Draft candidates for the next verification, excluding the committed anchor.
+     * PD PREFILL returns one candidate for MTP/EAGLE and none for DSpARK.
+     * MTP/EAGLE PREFILL also includes Q and final draft hidden because D may run without PP:
+     * Q verifies the carried candidate; hidden continues multi-step drafting.
+     * Other roles leave Q and hidden undefined.
+     */
+    torch::Tensor propose_token_ids;     /** CPU int32 [B, K], target vocabulary. */
+    torch::Tensor propose_all_probs;     /** Optional CPU FP32 [B, 1, draft_vocab_size]. */
+    torch::Tensor propose_hidden_states; /** Optional CPU [B, H]. */
 };
 
 }  // namespace rtp_llm

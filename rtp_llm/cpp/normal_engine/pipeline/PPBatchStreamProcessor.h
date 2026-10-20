@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "rtp_llm/cpp/engine_base/stream/SamplingState.h"
@@ -16,16 +17,20 @@ public:
                            const PDSepConfig&                 pd_sep_config,
                            const ProfilingDebugLoggingConfig& profiling_debug_logging_config,
                            const CacheConfig&                 cache_config,
-                           bool                               warm_up,
-                           SpeculativeType                    sp_type = SP_TYPE_NONE);
+                           const SpeculativeExecutionConfig&  sp_config,
+                           bool                               warm_up);
 
     PPSamplingPlan gatherSamplingPlan(const StreamGroups& stream_groups) const;
 
     PPOutputConfig gatherOutputConfig(const StreamGroups& stream_groups) const;
 
-    void initSamplingStates(const PPSamplingPlan& sampling_plan,
-                            SamplingStates&       sampling_states,
-                            PPExecutionResult&    result) const;
+    void prepareSampling(const PPExecutionPlan&                            plan,
+                         const std::unordered_map<int64_t, torch::Tensor>& dspark_q,
+                         const torch::Tensor&                              d2t_map,
+                         SamplingStates&                                   sampling_states,
+                         PPExecutionResult&                                result,
+                         SamplerOutput&                                    draft_sampler_output,
+                         speculative::SpeculativeSamplingParams&           verify_params);
 
     SamplerInputs gatherSamplerInputs(const PPSamplingPlan& sampling_plan,
                                       const PPOutputConfig& output_config,
@@ -101,6 +106,8 @@ private:
 private:
     const bool                 sp_enabled_;
     const bool                 is_dspark_;
+    const int64_t              propose_step_;
+    torch::Tensor              dspark_verify_q_buffer_;
     const std::vector<int64_t> output_vocab_ids_;
     const int64_t             processor_eos_token_id_;
 };

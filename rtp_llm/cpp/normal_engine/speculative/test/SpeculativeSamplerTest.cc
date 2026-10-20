@@ -86,64 +86,52 @@ public:
     }
 };
 
-TEST(MixedDraftProbabilitiesTest, MatchesExplicitTargetQWithoutCopyingSameVocabBatch) {
-    constexpr int64_t batch = 4;
-    constexpr int64_t steps = 2;
-    const auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    const auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-    const auto compact_q = torch::tensor({{{.1f, .9f}, {.2f, .8f}},
-                                          {{.3f, .7f}, {.4f, .6f}},
-                                          {{.5f, .5f}, {.6f, .4f}},
-                                          {{.7f, .3f}, {.8f, .2f}}}, f32);
+SpeculativeSamplingParams seededSamplingParams(int64_t batch) {
+    SpeculativeSamplingParams params;
+    params.do_sample    = torch::ones({batch}, torch::kBool);
+    params.force_accept = torch::zeros({batch}, torch::kBool);
+    for (int64_t row = 0; row < batch; ++row) {
+        auto generator = torch::make_generator<at::CUDAGeneratorImpl>();
+        generator.set_current_seed(100 + row);
+        params.generators.push_back(generator);
+    }
+    return params;
+}
+
+TEST(DraftProbabilitiesTest, MapsDenseQAndReusesBufferWithoutCopyingSameVocabBatch) {
+    constexpr int64_t batch     = 4;
+    constexpr int64_t steps     = 2;
+    const auto        f32       = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const auto        i64       = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    const auto        compact_q = torch::tensor(
+        {{{.1f, .9f}, {.2f, .8f}}, {{.3f, .7f}, {.4f, .6f}}, {{.5f, .5f}, {.6f, .4f}}, {{.7f, .3f}, {.8f, .2f}}}, f32);
     auto dense_q = torch::zeros({batch, steps, 4}, f32);
     dense_q.select(2, 1).copy_(compact_q.select(2, 0));
     dense_q.select(2, 3).copy_(compact_q.select(2, 1));
     SamplerOutput target;
-    target.all_probs = torch::tensor({.2f, .3f, .1f, .4f}, f32).reshape({1, 1, 4}).repeat({batch, steps + 1, 1});
-    target.token_ids = target.all_probs.argmax(-1).reshape({batch * (steps + 1), 1}).to(torch::kInt32);
-    auto sampling_params = [=] {
-        SpeculativeSamplingParams params;
-        params.do_sample = torch::ones({batch}, torch::kBool);
-        params.force_accept = torch::zeros({batch}, torch::kBool);
-        for (int64_t row = 0; row < batch; ++row) {
-            auto generator = torch::make_generator<at::CUDAGeneratorImpl>();
-            generator.set_current_seed(100 + row);
-            params.generators.push_back(generator);
-        }
-        return params;
-    };
+    target.all_probs     = torch::tensor({.2f, .3f, .1f, .4f}, f32).reshape({1, 1, 4}).repeat({batch, steps + 1, 1});
+    target.token_ids     = target.all_probs.argmax(-1).reshape({batch * (steps + 1), 1}).to(torch::kInt32);
 
     for (bool reduced_vocab : {false, true}) {
         SCOPED_TRACE(reduced_vocab);
         InspectableSpeculativeSampler sampler(reduced_vocab ? torch::tensor({1, 3}, i64) : torch::Tensor(), steps);
-        SpeculativeSampler reference({}, steps);
-        float* mapped_storage = nullptr;
-        /** Reuse the sampler with different missing rows and then all dense rows to expose stale q. */
-        for (const std::vector<int64_t>& rows : std::vector<std::vector<int64_t>>{{0, 2}, {1, 3}, {}}) {
-            SCOPED_TRACE(::testing::PrintToString(rows));
-            auto params = sampling_params();
+        SpeculativeSampler            reference({}, steps);
+        float*                        mapped_storage = nullptr;
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            SCOPED_TRACE(iteration);
+            auto          params = seededSamplingParams(batch);
             SamplerOutput draft;
-            draft.token_ids = torch::tensor({1, 3}, torch::kInt32).reshape({1, steps}).repeat({batch, 1});
-            draft.all_probs = (reduced_vocab ? compact_q : dense_q).clone();
-            auto expected_q = dense_q.clone();
-            for (int64_t row : rows) {
-                /** Tokens 0 and 2 are outside d2t={1,3}; the one-hot must be filled after mapping. */
-                draft.token_ids[row].copy_(torch::tensor({0, 2}, torch::kInt32));
-                draft.all_probs[row].zero_();
-                expected_q[row].zero_();
-                expected_q[row][0][0] = 1;
-                expected_q[row][1][2] = 1;
-            }
-            if (!rows.empty()) {
-                params.draft_point_mass_rows = torch::tensor(rows, torch::kInt64);
-            }
-            const auto input_snapshot = draft.all_probs.clone();
-            const auto input_storage = draft.all_probs.data_ptr<float>();
+            draft.token_ids              = torch::tensor({1, 3}, torch::kInt32).reshape({1, steps}).repeat({batch, 1});
+            const auto source_q          = reduced_vocab ? compact_q : dense_q;
+            draft.all_probs              = iteration == 0 ? source_q.clone() : source_q.flip({0});
+            const auto    expected_q     = iteration == 0 ? dense_q : dense_q.flip({0});
+            const auto    input_snapshot = draft.all_probs.clone();
+            const auto    input_storage  = draft.all_probs.data_ptr<float>();
             SamplerOutput expected_draft;
             expected_draft.token_ids = draft.token_ids;
             expected_draft.all_probs = expected_q;
-            const auto actual = sampler.forward(params, draft, target);
-            const auto expected = reference.forward(sampling_params(), expected_draft, target);
+            const auto actual        = sampler.forward(params, draft, target);
+            const auto expected      = reference.forward(seededSamplingParams(batch), expected_draft, target);
             EXPECT_TRUE(torch::equal(actual.accept_tokens, expected.accept_tokens));
             EXPECT_TRUE(torch::equal(actual.accept_len, expected.accept_len));
             if (reduced_vocab) {
@@ -159,18 +147,84 @@ TEST(MixedDraftProbabilitiesTest, MatchesExplicitTargetQWithoutCopyingSameVocabB
                 EXPECT_FALSE(sampler.mappedDraftProbs().defined());
             }
         }
-        /** Returning to an all-point-mass batch must ignore the previous dense mapping buffer. */
-        SamplerOutput implicit_draft;
-        implicit_draft.token_ids = torch::zeros({batch, steps}, torch::kInt32);
-        implicit_draft.token_ids_are_point_mass = true;
+    }
+}
+
+TEST(DraftProbabilitiesTest, TargetVocabularyQIsUsedWithoutApplyingDraftMap) {
+    const auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    const auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    for (bool reduced_vocab : {true, false}) {
+        SCOPED_TRACE(reduced_vocab);
+        const auto    map = reduced_vocab ? torch::tensor({1, 3}, i64) : torch::tensor({2, 0, 3, 1}, i64);
+        SamplerOutput draft;
+        draft.token_ids = torch::tensor({reduced_vocab ? 1 : 2, 3, 0, 0}, torch::kInt32).reshape({2, 2});
+        /** PP prepares both mapped model Q and handoff delta(0) in the target vocabulary. */
+        draft.all_probs = torch::zeros({2, 2, 4}, f32);
+        draft.all_probs[0].copy_(reduced_vocab ? torch::tensor({{0.f, .25f, 0.f, .75f}, {0.f, .5f, 0.f, .5f}}, f32) :
+                                                 torch::tensor({{.2f, .4f, .1f, .3f}, {.3f, .1f, .4f, .2f}}, f32));
+        draft.all_probs[1].select(1, 0).fill_(1);
+        const auto    input_snapshot = draft.all_probs.clone();
+        const auto    input_storage  = draft.all_probs.data_ptr<float>();
+        SamplerOutput target;
+        target.all_probs = torch::tensor({.1f, .2f, .3f, .4f}, f32).reshape({1, 1, 4}).repeat({2, 3, 1});
+        target.token_ids = target.all_probs.argmax(-1).reshape({6, 1}).to(torch::kInt32);
+
+        /** Row 0 accepts both candidates; row 1 rejects token 0 and samples token 2 from the residual CDF. */
+        auto uniforms  = torch::full({2, 3}, .5f, f32);
+        uniforms[1][0] = .9f;
+        auto tokens    = torch::full({2, 3}, -7, i32);
+        auto lengths   = torch::zeros({2}, i32);
+        execRejectionSampling({draft.all_probs,
+                               draft.token_ids.to(torch::kCUDA),
+                               uniforms,
+                               target.all_probs,
+                               target.token_ids,
+                               tokens,
+                               lengths,
+                               torch::ones({2}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA)),
+                               false});
+        EXPECT_TRUE(torch::equal(lengths.cpu(), torch::tensor({3, 1}, torch::kInt32)));
+        EXPECT_TRUE(torch::equal(
+            tokens.cpu(), torch::tensor({reduced_vocab ? 1 : 2, 3, 3, 2, -1, -1}, torch::kInt32).reshape({2, 3})));
+
+        InspectableSpeculativeSampler sampler(map, 2);
+        SpeculativeSampler            reference({}, 2);
+        const auto                    actual   = sampler.forward(seededSamplingParams(2), draft, target);
+        const auto                    expected = reference.forward(seededSamplingParams(2), draft, target);
+        EXPECT_TRUE(torch::equal(actual.accept_tokens, expected.accept_tokens));
+        EXPECT_TRUE(torch::equal(actual.accept_len, expected.accept_len));
+        EXPECT_FALSE(sampler.mappedDraftProbs().defined());
+        EXPECT_EQ(draft.all_probs.data_ptr<float>(), input_storage);
+        EXPECT_TRUE(torch::equal(draft.all_probs, input_snapshot));
+    }
+}
+
+TEST(DraftProbabilitiesTest, PointMassCandidatesMatchExplicitQWithoutVocabularyMapping) {
+    const auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    for (bool reduced_vocab : {false, true}) {
+        SCOPED_TRACE(reduced_vocab);
+        InspectableSpeculativeSampler sampler(reduced_vocab ? torch::tensor({1, 3}, i64) : torch::Tensor(), 2);
+        SpeculativeSampler            reference({}, 2);
+        SamplerOutput                 draft;
+        /** MTP candidates are target IDs; token 0 need not be present in the draft vocabulary. */
+        draft.token_ids                = torch::zeros({2, 2}, torch::kInt32);
+        draft.token_ids_are_point_mass = true;
         SamplerOutput explicit_draft;
-        explicit_draft.token_ids = implicit_draft.token_ids;
-        explicit_draft.all_probs = torch::zeros({batch, steps, 4}, f32);
+        explicit_draft.token_ids = draft.token_ids;
+        explicit_draft.all_probs = torch::zeros({2, 2, 4}, f32);
         explicit_draft.all_probs.select(2, 0).fill_(1);
-        const auto implicit_result = sampler.forward(sampling_params(), implicit_draft, target);
-        const auto explicit_result = reference.forward(sampling_params(), explicit_draft, target);
-        EXPECT_TRUE(torch::equal(implicit_result.accept_tokens, explicit_result.accept_tokens));
-        EXPECT_TRUE(torch::equal(implicit_result.accept_len, explicit_result.accept_len));
+        SamplerOutput target;
+        target.all_probs = torch::tensor({.2f, .3f, .1f, .4f}, f32).reshape({1, 1, 4}).repeat({2, 3, 1});
+        target.token_ids = target.all_probs.argmax(-1).reshape({6, 1}).to(torch::kInt32);
+
+        const auto actual   = sampler.forward(seededSamplingParams(2), draft, target);
+        const auto expected = reference.forward(seededSamplingParams(2), explicit_draft, target);
+        EXPECT_TRUE(torch::equal(actual.accept_tokens, expected.accept_tokens));
+        EXPECT_TRUE(torch::equal(actual.accept_len, expected.accept_len));
+        EXPECT_FALSE(draft.all_probs.defined());
+        EXPECT_FALSE(sampler.mappedDraftProbs().defined());
     }
 }
 

@@ -40,7 +40,7 @@ def pp_suites(gpu_type):
     _pp_test("qwen3_multi_task_prompt_pp2_pd_test", 4, ["multi_task_prompt_pp2_pd"], gpu_type = gpu_type)
     _pp_test("qwen35_multi_task_prompt_pp2_mtp_test", 2, ["multi_task_prompt_pp2_mtp"], dense = True, max_seq_len = 8192, gpu_type = gpu_type)
     _pp_test("qwen35_multi_task_prompt_pp2_pd_mtp_test", 4, ["multi_task_prompt_pp2_pd_mtp"], dense = True, max_seq_len = 8192, gpu_type = gpu_type)
-    _pp_test("qwen35_pd_mtp_pp_test", 4, ["sym_mtp1", "sym_mtp3"], dense = True, gpu_type = gpu_type)
+    _pp_test("qwen35_pd_mtp_pp_test", 4, ["sym_mtp1", "sym_mtp3", "pp2_pp1_mtp3"], dense = True, gpu_type = gpu_type)
     _pp_test("qwen3_pd_pp_alltoall_test", 6, ["cp_full_alltoall"], extra_args = " --use_ub_comm 0", gpu_type = gpu_type)
     _pp_test("qwen3_multi_task_prompt_pp2_cp2_test", 8, ["multi_task_prompt_pp2_cp2"], gpu_type = gpu_type)
 
@@ -54,6 +54,7 @@ def pp_suites(gpu_type):
             ":qwen3_pd_pp_cp_memory_cache_test",
             ":qwen35_pp_mtp_memory_cache_test",
             ":qwen35_dense_mtp_pp_test",
+            ":qwen35_pd_mtp_pp_test",
             ":qwen3_pp_depth_test",
             ":qwen35_pp_shutdown_mtp_test",
             ":qwen3_multi_task_prompt_pp2_tp2_test",

@@ -57,6 +57,14 @@ VARIANTS = {
         "decode_tp": 1,
         "sp": 3,
     },
+    # Non-PP decode uses the carried Q and hidden states to continue multi-step MTP.
+    "pp2_pp1_mtp3": {
+        "prefill_pp": 2,
+        "prefill_tp": 1,
+        "decode_pp": 1,
+        "decode_tp": 1,
+        "sp": 3,
+    },
     "asym": {"prefill_pp": 2, "prefill_tp": 1, "decode_pp": 2, "decode_tp": 2},
     "conv": {"prefill_pp": 2, "prefill_tp": 2, "decode_pp": 2, "decode_tp": 1},
     # Two-server PD context-parallel cases.

@@ -4,6 +4,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -127,12 +128,16 @@ private:
 
     void advanceSamplingStates(const PPSamplingPlan& sampling_plan, PPExecutionResult& result);
 
+    void eraseFailedDSparkQ(const PPExecutionResult& result);
+
     absl::Status processExecutionResult(InflightBatch& batch);
 
-    void verifyDraftTokens(const PPExecutionPlan&                 plan,
-                           const torch::Tensor&                   target_logits,
-                           SamplerOutput&                         target_sampler_output,
-                           speculative::SpeculativeSamplerOutput& accepted);
+    void verifyDraftTokens(const PPExecutionPlan&                        plan,
+                           const torch::Tensor&                          target_logits,
+                           SamplerOutput&                                draft_sampler_output,
+                           const speculative::SpeculativeSamplingParams& verify_params,
+                           SamplerOutput&                                target_sampler_output,
+                           speculative::SpeculativeSamplerOutput&        accepted);
 
     void prepareDraftPrefillAfterTargetPrefill(GptModelInputs&      draft_prefill_input,
                                                const torch::Tensor& target_hidden_states,
@@ -218,6 +223,9 @@ private:
     TensorHolder   buffer_holder_;
     SamplingStates sampling_states_;
 
+    /** Keep draft-vocabulary Q on the last-stage GPU, keyed by request to survive pipeline-slot reuse. */
+    std::unordered_map<int64_t, torch::Tensor> dspark_q_;
+
     /** A processed terminal plan prevents further execution while the engine waits for local stop(). */
     bool stopped_ = false;
 
@@ -231,6 +239,7 @@ private:
     const mtp::DraftInputLayout                      draft_input_layout_ = mtp::selectDraftInputLayout(false);
     mtp::DSparkProposeInputBuffers                   dspark_propose_input_buffers_;
     size_t                                           draft_vocab_size_ = 0;
+    torch::Tensor                                    d2t_map_;
     torch::Tensor                                    dspark_markov_w1_;
     torch::Tensor                                    dspark_markov_w2_;
     std::unique_ptr<SpecLogitsVerifyRunner>          spec_logits_verify_runner_;

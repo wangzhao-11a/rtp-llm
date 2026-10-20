@@ -672,8 +672,12 @@ protected:
             first->update({intTensor({7}).reshape({1, 1}), 1}, false);
             second->update({intTensor({8}).reshape({1, 1}), 1}, false);
         }
-        PPBatchStreamProcessor processor(params.model_config_, params.pd_sep_config,
-                                        ProfilingDebugLoggingConfig{}, CacheConfig{}, false, params.sp_config.type);
+        PPBatchStreamProcessor processor(params.model_config_,
+                                         params.pd_sep_config,
+                                         ProfilingDebugLoggingConfig{},
+                                         CacheConfig{},
+                                         params.sp_config,
+                                         false);
         const StreamGroups groups({first, second});
         PPExecutionPlan plan;
         plan.is_decode = decode;
@@ -701,14 +705,6 @@ protected:
             input.prefix_lengths = intTensor({2, 3});
             input.sequence_lengths = intTensor({});
             input.lm_output_indexes = torch::arange(2 * (width + 1), torch::kInt32);
-            if (params.sp_config.type == SP_TYPE_DSPARK) {
-                /** Model a prior C++ proposal round with an exact q for each draft token. */
-                const auto draft_tokens = input.combo_tokens.reshape({2, width + 1}).narrow(1, 1, width).to(torch::kLong);
-                plan.sampling_plan.draft_all_probs =
-                    torch::zeros({2, width, params.model_config_.vocab_size}, torch::kFloat32)
-                        .scatter_(-1, draft_tokens.unsqueeze(-1), 1.0f)
-                        .contiguous();
-            }
         } else if (decode) {
             input.combo_tokens = intTensor({7, 8});
             input.input_lengths = intTensor({2, 3});
@@ -723,6 +719,23 @@ protected:
             input.lm_output_indexes = intTensor({1, 4});
         }
         return plan;
+    }
+
+    static void cacheDSparkProposals(PPExecutor& executor, const PPExecutionPlan& plan) {
+        if (!executor.is_dspark_) {
+            return;
+        }
+        const auto batch = plan.sampling_plan.request_ids.numel();
+        const auto width = executor.propose_step_;
+        const auto tokens = plan.model_input.combo_tokens.reshape({batch, width + 1})
+                                .narrow(1, 1, width).to(torch::kCUDA, torch::kLong);
+        const auto q = torch::zeros({batch, width, static_cast<int64_t>(executor.draft_vocab_size_)},
+                                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA))
+                           .scatter_(-1, tokens.unsqueeze(-1), 1.0f);
+        const auto* ids = plan.sampling_plan.request_ids.data_ptr<int64_t>();
+        for (int64_t row = 0; row < batch; ++row) {
+            executor.dspark_q_.emplace(ids[row], q[row]);
+        }
     }
 
     static void enableMetrics(PPExecutor& executor) {
@@ -745,8 +758,12 @@ protected:
             test::makeSimpleMhaCacheConfig(3, 16, 4, DataType::TYPE_FP16));
         EXPECT_TRUE(resources.cache_manager->init());
         auto stream = makeFakeStream(params, resources, decode);
-        PPBatchStreamProcessor processor(params.model_config_, params.pd_sep_config, ProfilingDebugLoggingConfig{},
-                                        resources.cache_manager->cacheConfig(), false, params.sp_config.type);
+        PPBatchStreamProcessor processor(params.model_config_,
+                                         params.pd_sep_config,
+                                         ProfilingDebugLoggingConfig{},
+                                         resources.cache_manager->cacheConfig(),
+                                         params.sp_config,
+                                         false);
         const StreamGroups groups({stream});
         TensorHolder holder;
         auto input = decode && params.sp_config.type != SP_TYPE_NONE ?
@@ -2101,6 +2118,7 @@ TEST_F(PPExecutorTpTest, ShutdownPlanStopsEveryTpRankBeforeOrDuringFinishWithout
                         EXPECT_TRUE(recorded_draft->inputs.empty());
                     }
                     EXPECT_TRUE(executor.sampling_states_.empty());
+                    EXPECT_TRUE(executor.dspark_q_.empty());
                     for (const auto& batch : executor.slots_) {
                         EXPECT_FALSE(batch.result_pending);
                         EXPECT_TRUE(batch.plan_sends.empty());
@@ -3160,6 +3178,7 @@ TEST_F(PPExecutorTest, LastPrefillOnlyRunsNormalDraftWorkOnRealKvWithoutTargetSa
                     ASSERT_EQ(target->inputs.size(), 1u);
                     EXPECT_TRUE(target->inputs[0].skip_lm_head);
                     EXPECT_TRUE(executor.sampling_states_.empty());
+                    EXPECT_TRUE(executor.dspark_q_.empty());
                     EXPECT_EQ(publication_waits, 0);
                     ASSERT_EQ(wire->sent_tensors.size(), 2u);
                     const auto result = lastResult(*wire);
@@ -3178,8 +3197,7 @@ TEST_F(PPExecutorTest, LastPrefillOnlyRunsNormalDraftWorkOnRealKvWithoutTargetSa
                         EXPECT_FALSE(result.propose_all_probs.defined());
                         continue;
                     }
-                    EXPECT_EQ(result.propose_all_probs.defined(),
-                              type == SP_TYPE_DSPARK ? role == RoleType::PDFUSION : role == RoleType::PREFILL);
+                    EXPECT_EQ(result.propose_all_probs.defined(), type != SP_TYPE_DSPARK && role == RoleType::PREFILL);
                     const auto& first = drafts->front();
                     EXPECT_TRUE(torch::equal(first.kv_cache_block_id.cpu(), plan.model_input.kv_cache_block_id));
                     EXPECT_TRUE(torch::equal(first.last_hidden_states, target->hidden_buffer));
@@ -3293,11 +3311,14 @@ TEST_F(PPExecutorTest, LastPrefillProducesOnlyTheDraftWorkRequiredByItsRole) {
                     ASSERT_EQ(result.propose_token_ids.sizes().vec(), (std::vector<int64_t>{2, count}));
                     EXPECT_TRUE(result.propose_token_ids.device().is_cpu());
                     if (type == SP_TYPE_DSPARK) {
-                        ASSERT_EQ(result.propose_all_probs.sizes().vec(),
-                                  (std::vector<int64_t>{2, count, params.model_config_.vocab_size}));
-                        EXPECT_TRUE(result.propose_all_probs.device().is_cpu());
-                        EXPECT_EQ(result.propose_all_probs.scalar_type(), torch::kFloat32);
-                        EXPECT_TRUE(result.propose_all_probs.is_contiguous());
+                        EXPECT_FALSE(result.propose_all_probs.defined());
+                        ASSERT_EQ(executor.dspark_q_.size(), 2u);
+                        for (const auto id : {101, 202}) {
+                            const auto& q = executor.dspark_q_.at(id);
+                            EXPECT_EQ(q.sizes().vec(), (std::vector<int64_t>{count, params.model_config_.vocab_size}));
+                            EXPECT_TRUE(q.is_cuda());
+                            EXPECT_EQ(q.scalar_type(), torch::kFloat32);
+                        }
                     } else if (role == RoleType::PREFILL) {
                         ASSERT_EQ(result.propose_all_probs.sizes().vec(), (std::vector<int64_t>{2, 1, 64}));
                         auto expected_q = torch::zeros({2, 1, 64}, torch::kFloat32);
@@ -3530,7 +3551,132 @@ TEST_F(PPExecutorTest, PrefillHandoffUsesExplicitDraftOutputWithoutMtpBuffer) {
     EXPECT_TRUE(torch::equal(result.propose_hidden_states, expected));
 }
 
-TEST_F(PPExecutorTest, LastDSparkHandoffVerifiesPointMassThenProposesWithDenseProbabilities) {
+TEST_F(PPExecutorTest, LastDSparkPrefillQIsConsumedByNextVerification) {
+    constexpr int width = 2;
+    auto params = makeStageParams(2, SP_TYPE_DSPARK, width);
+    params.pd_sep_config.role_type = RoleType::PDFUSION;
+    auto propose = makeMtpProposeParams(params);
+    PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
+    auto* wire = attachTransport(executor);
+    auto* target = installModel<RecordingDraftModel>(executor);
+    target->next_tokens = {7, 8};
+    auto draft = installDSparkModels(executor, width);
+    enqueuePlan(*wire, makePlan(params));
+    ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+    const auto prefill = lastResult(*wire);
+    ASSERT_EQ(executor.dspark_q_.size(), 2u);
+    EXPECT_FALSE(prefill.propose_all_probs.defined());
+
+    auto verify = makePlan(params, true);
+    verify.model_input.combo_tokens = torch::cat({prefill.new_token_ids, prefill.propose_token_ids}, 1).flatten();
+    const auto expected = torch::cat({prefill.propose_token_ids, intTensor({30, 31}).reshape({2, 1})}, 1);
+    target->next_tokens = tensorToVector<int32_t>(expected);
+    draft->on_forward = [&] { EXPECT_TRUE(executor.dspark_q_.empty()); };
+    enqueuePlan(*wire, verify);
+    ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+    const auto result = lastResult(*wire);
+    EXPECT_TRUE(result.request_errors[0].ok());
+    EXPECT_TRUE(result.request_errors[1].ok());
+    EXPECT_TRUE(torch::equal(result.new_token_ids, expected));
+    EXPECT_EQ(tensorToVector<int32_t>(result.new_token_lengths), (std::vector<int32_t>{width + 1, width + 1}));
+    EXPECT_FALSE(result.propose_all_probs.defined());
+    EXPECT_EQ(executor.dspark_q_.size(), 2u);
+    EXPECT_TRUE(executor.dspark_q_.at(101).is_cuda());
+}
+
+TEST_F(PPExecutorTest, LastDSparkConsumesOldQBeforeDraftAndDiscardsQAfterUpdateFailure) {
+    for (bool fake_cleanup : {false, true}) {
+        SCOPED_TRACE(fake_cleanup);
+        auto params = makeStageParams(2, SP_TYPE_DSPARK);
+        params.pd_sep_config.role_type = RoleType::DECODE;
+        auto propose = makeMtpProposeParams(params);
+        PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
+        auto* wire = attachTransport(executor);
+        auto plan = makePlan(params, true);
+        cacheDSparkProposals(executor, plan);
+        auto failed = recordState(executor, 101);
+        recordState(executor, 202);
+        failed->update_error = ErrorInfo(ErrorCode::UNKNOWN_ERROR, "state update failed after draft");
+        const auto other_q = executor.dspark_q_.at(202);
+        executor.dspark_q_.emplace(303, other_q);
+        auto* target = installModel<RecordingDraftModel>(executor);
+        target->next_tokens = {11, 12, 13, 14, 21, 22, 23, 24};
+        auto draft = installDSparkModels(executor, 3);
+        draft->on_forward = [&] {
+            EXPECT_EQ(executor.dspark_q_.count(101), 0u);
+            EXPECT_EQ(executor.dspark_q_.count(202), 0u);
+            EXPECT_TRUE(torch::equal(executor.dspark_q_.at(303), other_q));
+        };
+        failed->on_update = [&] {
+            EXPECT_EQ(draft->inputs.size(), 2u);
+            EXPECT_TRUE(executor.dspark_q_.at(101).is_cuda());
+            EXPECT_TRUE(executor.dspark_q_.at(202).is_cuda());
+        };
+        enqueuePlan(*wire, plan);
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        const auto result = lastResult(*wire);
+        EXPECT_EQ(result.request_errors[0].ToString(), failed->update_error->ToString());
+        EXPECT_TRUE(result.request_errors[1].ok());
+        EXPECT_FALSE(result.propose_all_probs.defined());
+        EXPECT_EQ(executor.dspark_q_.count(101), 0u);
+        EXPECT_TRUE(executor.dspark_q_.at(202).is_cuda());
+        EXPECT_TRUE(torch::equal(executor.dspark_q_.at(303), other_q));
+
+        /** Completion/cancellation can retire the new proposal without another verification. */
+        draft->on_forward = {};
+        PPExecutionPlan cleanup = fake_cleanup ? makeFakePlan(params, false) : PPExecutionPlan{};
+        cleanup.model_input.skip_run = !fake_cleanup;
+        cleanup.finished_request_ids = {101, 202, 303};
+        enqueuePlan(*wire, cleanup);
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        EXPECT_TRUE(executor.dspark_q_.empty());
+        EXPECT_TRUE(executor.sampling_states_.empty());
+
+        /** Reused IDs start with zero-padded handoffs; the old Q and failed processor must be gone. */
+        plan.model_input.combo_tokens.reshape({2, executor.propose_step_ + 1}).slice(1, 1).zero_();
+        enqueuePlan(*wire, plan);
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        const auto reused = lastResult(*wire);
+        EXPECT_TRUE(reused.request_errors[0].ok());
+        EXPECT_TRUE(reused.request_errors[1].ok());
+        EXPECT_EQ(executor.dspark_q_.size(), 2u);
+    }
+}
+
+TEST_F(PPExecutorTest, LastDSparkMissingQFailsRequestsWithoutRecreatingTheirCache) {
+    for (bool all_missing : {false, true}) {
+        SCOPED_TRACE(all_missing);
+        auto params = makeStageParams(2, SP_TYPE_DSPARK);
+        params.pd_sep_config.role_type = RoleType::DECODE;
+        auto propose = makeMtpProposeParams(params);
+        PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
+        auto* wire = attachTransport(executor);
+        auto plan = makePlan(params, true);
+        recordState(executor, 101);
+        recordState(executor, 202);
+        if (!all_missing) {
+            cacheDSparkProposals(executor, plan);
+            executor.dspark_q_.erase(202);
+        }
+        auto* target = installModel<RecordingDraftModel>(executor);
+        target->next_tokens = {11, 12, 13, 14, 21, 22, 23, 24};
+        auto draft = installDSparkModels(executor, 3);
+        enqueuePlan(*wire, plan);
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        const auto result = lastResult(*wire);
+        EXPECT_EQ(result.request_errors[0].hasError(), all_missing);
+        EXPECT_TRUE(result.request_errors[1].hasError());
+        EXPECT_NE(result.request_errors[1].ToString().find("missing PP DSpARK proposal probabilities"),
+                  std::string::npos);
+        EXPECT_EQ(result.new_token_ids[1].count_nonzero().item<int64_t>(), 0);
+        EXPECT_EQ(executor.dspark_q_.count(101), all_missing ? 0u : 1u);
+        EXPECT_EQ(executor.dspark_q_.count(202), 0u);
+        EXPECT_EQ(draft->inputs.size(), 2u);
+        EXPECT_FALSE(result.propose_all_probs.defined());
+    }
+}
+
+TEST_F(PPExecutorTest, LastDSparkHandoffVerifiesZeroCandidatesAndCachesNextQ) {
     constexpr int width = 3;
     auto params = makeStageParams(2, SP_TYPE_DSPARK, width);
     params.pd_sep_config.role_type = RoleType::DECODE;
@@ -3540,11 +3686,14 @@ TEST_F(PPExecutorTest, LastDSparkHandoffVerifiesPointMassThenProposesWithDensePr
 
     auto plan = makePlan(params, true);
     plan.model_input.combo_tokens      = intTensor({7, 0, 0, 0, 8, 0, 0, 0});
+    plan.sampling_plan.do_sample.fill_(true);
+    plan.sampling_plan.spec_do_sample.fill_(true);
+    plan.sampling_plan.top_k.zero_();
+    plan.sampling_plan.top_p.fill_(1);
     plan.model_input.input_lengths     = intTensor({4, 4});
     plan.model_input.prefix_lengths    = intTensor({2, 3});
     plan.model_input.sequence_lengths  = intTensor({});
     plan.model_input.lm_output_indexes = torch::arange(8, torch::kInt32);
-    plan.sampling_plan.draft_all_probs = torch::Tensor();
     enqueuePlan(*wire, plan);
 
     auto target = std::make_unique<RecordingDraftModel>();
@@ -3569,8 +3718,11 @@ TEST_F(PPExecutorTest, LastDSparkHandoffVerifiesPointMassThenProposesWithDensePr
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids.select(1, 0)), (std::vector<int32_t>{40, 50}));
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_lengths), (std::vector<int32_t>{1, 1}));
     ASSERT_EQ(result.propose_token_ids.sizes().vec(), (std::vector<int64_t>{2, width}));
-    ASSERT_EQ(result.propose_all_probs.sizes().vec(),
-              (std::vector<int64_t>{2, width, params.model_config_.vocab_size}));
+    EXPECT_FALSE(result.propose_all_probs.defined());
+    ASSERT_EQ(executor.dspark_q_.size(), 2u);
+    EXPECT_EQ(executor.dspark_q_.at(101).sizes().vec(),
+              (std::vector<int64_t>{width, params.model_config_.vocab_size}));
+    EXPECT_TRUE(executor.dspark_q_.at(101).is_cuda());
     ASSERT_EQ(recorded_draft->inputs.size(), 2u);
     EXPECT_TRUE(recorded_draft->inputs.front().is_target_verify);
     EXPECT_TRUE(recorded_draft->inputs.front().last_hidden_states.defined());
@@ -3595,8 +3747,10 @@ TEST_F(PPExecutorTest, LastDSparkMixedQVerifiesBeforeCommitAndFreshProposal) {
     plan.sampling_plan.top_p.fill_(1);
     plan.sampling_plan.temperature.fill_(1);
     plan.sampling_plan.random_seeds = {123, 456};
-    plan.sampling_plan.draft_all_probs.zero_();
-    plan.sampling_plan.draft_point_mass_rows = torch::tensor({1}, torch::kInt64);
+    recordState(executor, 101);
+    const auto old_q = torch::zeros({width, params.model_config_.vocab_size},
+                                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    executor.dspark_q_.emplace(101, old_q);
     auto target = std::make_unique<RecordingDraftModel>();
     auto* recorded_target = target.get();
     auto target_logits = torch::full({2 * (width + 1), params.model_config_.vocab_size + 8},
@@ -3604,12 +3758,12 @@ TEST_F(PPExecutorTest, LastDSparkMixedQVerifiesBeforeCommitAndFreshProposal) {
                                      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     /** Padding would dominate every real token if verify used the physical lm-head width. */
     target_logits.narrow(1, params.model_config_.vocab_size, 8).fill_(100);
-    /** A's true q equals p, so all its candidates are accepted; B's fixed 0 is rejected. */
+    /** Q = P makes request 101 accept every candidate; request 202 rejects its zero-padded handoff. */
     for (int step = 0; step < width; ++step) {
         target_logits[step][11 + step] = 0;
         target_logits[step][40] = 0;
-        plan.sampling_plan.draft_all_probs[0][step][11 + step] = .5;
-        plan.sampling_plan.draft_all_probs[0][step][40] = .5;
+        old_q[step][11 + step] = .5;
+        old_q[step][40] = .5;
     }
     target_logits[width][43] = 0;
     for (int step = 0; step <= width; ++step) {
@@ -3619,7 +3773,7 @@ TEST_F(PPExecutorTest, LastDSparkMixedQVerifiesBeforeCommitAndFreshProposal) {
     executor.setModel(std::move(target));
     auto draft = installDSparkModels(executor, width);
     auto* recorded_draft = draft.get();
-    const auto original_q = plan.sampling_plan.draft_all_probs.clone();
+    const auto original_q = old_q.clone();
     enqueuePlan(*wire, plan);
 
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
@@ -3627,7 +3781,7 @@ TEST_F(PPExecutorTest, LastDSparkMixedQVerifiesBeforeCommitAndFreshProposal) {
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_lengths), (std::vector<int32_t>{4, 1}));
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids[0]), (std::vector<int32_t>{11, 12, 13, 43}));
     EXPECT_EQ(result.new_token_ids[1][0].item<int32_t>(), 50);
-    EXPECT_TRUE(torch::equal(plan.sampling_plan.draft_all_probs, original_q));
+    EXPECT_TRUE(torch::equal(old_q, original_q));
     ASSERT_EQ(recorded_target->inputs.size(), 1u);
     EXPECT_TRUE(recorded_target->inputs[0].is_target_verify);
     ASSERT_EQ(recorded_draft->inputs.size(), 2u);
@@ -3635,10 +3789,12 @@ TEST_F(PPExecutorTest, LastDSparkMixedQVerifiesBeforeCommitAndFreshProposal) {
     EXPECT_TRUE(torch::equal(recorded_draft->inputs[0].combo_tokens, plan.model_input.combo_tokens));
     EXPECT_FALSE(recorded_draft->inputs[1].last_hidden_states.defined());
     EXPECT_EQ(tensorToVector<int32_t>(recorded_draft->inputs[1].prefix_lengths), (std::vector<int32_t>{6, 4}));
-    ASSERT_EQ(result.propose_all_probs.sizes().vec(), (std::vector<int64_t>{2, width, 64}));
-    EXPECT_TRUE(torch::equal(result.propose_all_probs.sum(-1), torch::ones({2, width})));
-    EXPECT_TRUE(torch::equal(result.propose_all_probs.argmax(-1).to(torch::kInt32), result.propose_token_ids));
-    EXPECT_EQ(result.propose_all_probs[1].select(1, 0).sum().item<float>(), 0);
+    EXPECT_FALSE(result.propose_all_probs.defined());
+    const auto next_q = torch::stack({executor.dspark_q_.at(101), executor.dspark_q_.at(202)}).cpu();
+    ASSERT_EQ(next_q.sizes().vec(), (std::vector<int64_t>{2, width, 64}));
+    EXPECT_TRUE(torch::equal(next_q.sum(-1), torch::ones({2, width})));
+    EXPECT_TRUE(torch::equal(next_q.argmax(-1).to(torch::kInt32), result.propose_token_ids));
+    EXPECT_EQ(next_q[1].select(1, 0).sum().item<float>(), 0);
 }
 
 TEST_F(PPExecutorTest, DSparkDraftTemperatureMatchesMainStochasticCondition) {
@@ -3667,9 +3823,12 @@ TEST_F(PPExecutorTest, DSparkDraftTemperatureMatchesMainStochasticCondition) {
         result.new_token_ids = intTensor({30, 31}).reshape({2, 1});
         result.new_token_lengths = intTensor({1, 1});
         executor.runDraftStep(plan.model_input, {}, hidden, true, plan.sampling_plan, result);
+        const auto q = torch::stack({executor.dspark_q_.at(101), executor.dspark_q_.at(202)});
         const float expected_temperature = do_sample && non_top1 ? .5f : 1.e-6f;
         const auto expected_q = torch::softmax(logits / expected_temperature, -1).reshape({2, width, 64}).cpu();
-        EXPECT_TRUE(torch::allclose(result.propose_all_probs, expected_q));
+        EXPECT_TRUE(q.is_cuda());
+        EXPECT_FALSE(result.propose_all_probs.defined());
+        EXPECT_TRUE(torch::allclose(q.cpu(), expected_q));
         if (!do_sample || !non_top1) {
             EXPECT_TRUE(torch::equal(result.propose_token_ids, torch::full({2, width}, 10, torch::kInt32)));
         }
@@ -3686,6 +3845,7 @@ TEST_F(PPExecutorTest, LastVerifyKeepsAcceptanceForDraftWhileCappingStateUpdates
             PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
             auto* wire = attachTransport(executor);
             auto plan = makePlan(params, true);
+            cacheDSparkProposals(executor, plan);
             /** Verify the full proposal even when the remaining output budget permits fewer tokens. */
             const int remaining = width == 1 ? 1 : 2;
             plan.sampling_plan.max_tokens[1] = plan.sampling_plan.sequence_lengths[1].item<int32_t>() + remaining;
@@ -3714,11 +3874,11 @@ TEST_F(PPExecutorTest, LastVerifyKeepsAcceptanceForDraftWhileCappingStateUpdates
             EXPECT_TRUE(result.request_errors[1].ok());
             ASSERT_EQ(result.propose_token_ids.sizes().vec(), (std::vector<int64_t>{2, width}));
             if (type == SP_TYPE_DSPARK) {
-                ASSERT_EQ(result.propose_all_probs.sizes().vec(),
-                          (std::vector<int64_t>{2, width, params.model_config_.vocab_size}));
-                EXPECT_TRUE(result.propose_all_probs.device().is_cpu());
-                EXPECT_EQ(result.propose_all_probs.scalar_type(), torch::kFloat32);
-                EXPECT_TRUE(result.propose_all_probs.is_contiguous());
+                EXPECT_FALSE(result.propose_all_probs.defined());
+                ASSERT_EQ(executor.dspark_q_.size(), 2u);
+                EXPECT_TRUE(executor.dspark_q_.at(101).is_cuda());
+                EXPECT_EQ(executor.dspark_q_.at(101).sizes().vec(),
+                          (std::vector<int64_t>{width, params.model_config_.vocab_size}));
             } else {
                 EXPECT_FALSE(result.propose_all_probs.defined());
             }
@@ -3746,6 +3906,21 @@ TEST_F(PPExecutorTest, LastVerifyKeepsAcceptanceForDraftWhileCappingStateUpdates
                 expected[1][0] = 21 + width;
                 EXPECT_TRUE(torch::equal(next.combo_tokens.cpu(), expected.flatten()));
             }
+            if (type == SP_TYPE_DSPARK) {
+                /** The head retires the length-limited row without another decode; an empty plan must release q. */
+                PPExecutionPlan cleanup;
+                cleanup.model_input.skip_run = true;
+                cleanup.finished_request_ids = {202};
+                enqueuePlan(*wire, cleanup);
+                ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+                EXPECT_EQ(executor.dspark_q_.count(202), 0u);
+                EXPECT_EQ(executor.dspark_q_.count(101), 1u);
+                cleanup.finished_request_ids = {101};
+                enqueuePlan(*wire, cleanup);
+                ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+                EXPECT_TRUE(executor.dspark_q_.empty());
+                EXPECT_EQ(draft_inputs->size(), forwards);
+            }
         }
     }
 }
@@ -3762,6 +3937,7 @@ TEST_F(PPExecutorTest, LastVerifyFailuresKeepDraftRowsForPartialAndWholeBatchErr
                 PPExecutor executor(params, nullptr, false, MlaOpsType::AUTO, nullptr, nullptr, propose.get());
                 auto* wire = attachTransport(executor);
                 auto plan = makePlan(params, true);
+                cacheDSparkProposals(executor, plan);
                 auto target = std::make_unique<RecordingDraftModel>();
                 target->next_tokens = {11, 40, 13, 14, 21, 22, 23, 24};
                 executor.setModel(std::move(target));
@@ -3772,10 +3948,14 @@ TEST_F(PPExecutorTest, LastVerifyFailuresKeepDraftRowsForPartialAndWholeBatchErr
                 std::shared_ptr<RecordingLogitsProcessor> healthy;
                 std::shared_ptr<RecordingLogitsProcessor> failed;
                 if (initialization_failed) {
-                    /** PD decode may reach this tail before it has created the request's sampling state. */
                     for (int row = all_failed ? 0 : 1; row < 2; ++row) {
                         plan.sampling_plan.logits_processor_configs[row].grammar_type = "regex";
                         plan.sampling_plan.logits_processor_configs[row].grammar_value = "[ab]+";
+                        if (type == SP_TYPE_DSPARK) {
+                            const auto request_id = plan.sampling_plan.request_ids[row].item<int64_t>();
+                            executor.dspark_q_.erase(request_id);
+                            plan.model_input.combo_tokens.reshape({2, 4})[row].slice(0, 1).zero_();
+                        }
                     }
                     if (!all_failed) {
                         healthy = recordState(executor, 101);
@@ -3805,6 +3985,10 @@ TEST_F(PPExecutorTest, LastVerifyFailuresKeepDraftRowsForPartialAndWholeBatchErr
                 }
                 EXPECT_EQ(inputs->size(), type == SP_TYPE_DSPARK ? 2u : 3u);
                 EXPECT_EQ(result.propose_token_ids.sizes().vec(), (std::vector<int64_t>{2, 3}));
+                if (type == SP_TYPE_DSPARK) {
+                    EXPECT_EQ(executor.dspark_q_.count(101), all_failed ? 0u : 1u);
+                    EXPECT_EQ(executor.dspark_q_.count(202), 0u);
+                }
             }
         }
     }
@@ -3826,6 +4010,7 @@ TEST_F(PPExecutorTest, LastOrdinaryFakeReturnsAResultButShutdownSkipsTargetAndDr
             ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
             ASSERT_EQ(wire->sent_tensors.size(), 2u);
             EXPECT_TRUE(executor.sampling_states_.empty());
+            EXPECT_TRUE(executor.dspark_q_.empty());
             const auto result = lastResult(*wire);
             EXPECT_EQ(result.sample_input_us, 0);
             const int token_count = draft_inputs && decode ? 4 : 1;
@@ -3845,6 +4030,7 @@ TEST_F(PPExecutorTest, LastOrdinaryFakeReturnsAResultButShutdownSkipsTargetAndDr
             EXPECT_EQ(wire->sent_tensors.size(), 2u);
             EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
             EXPECT_TRUE(executor.sampling_states_.empty());
+            EXPECT_TRUE(executor.dspark_q_.empty());
             if (draft_inputs) {
                 EXPECT_EQ(draft_inputs->size(), type == SP_TYPE_DSPARK ? 2u : 3u);
             }
@@ -4047,7 +4233,8 @@ TEST_F(PPExecutorTpTest, LastDraftDecodeSynchronizesOnlyItsInitialInput) {
                         result.new_token_ids     = intTensor({2, 5}).reshape({2, 1});
                         result.new_token_lengths = intTensor({1, 1});
                     }
-                    executor.runDraftStep(input, intTensor({5, 105, 8, 108}), target_hidden, false, {}, result);
+                    executor.runDraftStep(
+                        input, intTensor({5, 105, 8, 108}), target_hidden, false, {}, result);
 
                     ASSERT_EQ(recorded->inputs.size(), static_cast<size_t>(width));
                     ASSERT_EQ(forward_positions.size(), static_cast<size_t>(width));
@@ -4095,6 +4282,7 @@ TEST_F(PPExecutorTpTest, LastDraftDecodeSynchronizesOnlyItsInitialInput) {
                         EXPECT_FALSE(result.propose_all_probs.defined());
                     }
                     EXPECT_TRUE(executor.sampling_states_.empty());
+                    EXPECT_TRUE(executor.dspark_q_.empty());
                 }
             }
         }
@@ -4147,10 +4335,12 @@ TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfT
                 auto* draft_inputs = installDraftModel(
                     executor, type, 3, [&] { forward_positions.push_back(broadcasts.position()); });
                 if (rank == 0) {
+                    cacheDSparkProposals(executor, plan);
+                    auto healthy         = recordState(executor, 101);
                     auto failed = recordState(executor, 202);
                     failed->verify_error = ErrorInfo(ErrorCode::GRAMMAR_VERIFY_EXCEPTION, "verify failed");
                     if (all_failed) {
-                        recordState(executor, 101)->verify_error = failed->verify_error;
+                        healthy->verify_error = failed->verify_error;
                     }
                 }
                 ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
@@ -4178,6 +4368,7 @@ TEST_F(PPExecutorTpTest, LastTpVerifySynchronizesAcceptedRowsAndKeepsPeersOutOfT
                 } else {
                     EXPECT_TRUE(wire->sent_tensors.empty());
                     EXPECT_TRUE(executor.sampling_states_.empty());
+                    EXPECT_TRUE(executor.dspark_q_.empty());
                     EXPECT_EQ(broadcasts.position(), broadcasts.size());
                     EXPECT_EQ(forward_positions, root_forward_positions);
                     for (size_t step = 0; step < draft_inputs->size(); ++step) {
@@ -4266,6 +4457,7 @@ TEST_F(PPExecutorTpTest, PrefillOnlyTpPeersFollowTheSameDraftScheduleAndKeepCpFe
                         EXPECT_TRUE(first.pp_intermediates.empty());
                     }
                     EXPECT_TRUE(executor.sampling_states_.empty());
+                    EXPECT_TRUE(executor.dspark_q_.empty());
                     if (rank == 0) {
                         EXPECT_EQ(lastResult(*wire).new_token_ids.sizes().vec(), (std::vector<int64_t>{2, 1}));
                     } else {

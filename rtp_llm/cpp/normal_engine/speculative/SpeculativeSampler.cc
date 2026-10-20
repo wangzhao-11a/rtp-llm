@@ -180,20 +180,6 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&         sample_ou
         draft_token_probs_d_t = draft_probs_padding;
     }
 
-    if (params.draft_point_mass_rows.defined()) {
-        /** Fixed handoff candidates define q(token|prefix)=1 at the proposed token. Materialize
-         * that distribution only after d2t mapping: the target token may be absent from draft vocab.
-         * Fill only these scratch rows in the per-call q (or existing vocab-padding buffer), keeping
-         * sampled rows intact and avoiding another dense batch allocation. Both acceptance and
-         * residual sampling then use the same one-hot q through the ordinary dense kernel path. */
-        buffer_holder_.hold_host(params.draft_point_mass_rows);
-        auto rows   = params.draft_point_mass_rows.to(target_device, /*non_blocking=*/true);
-        auto tokens = draft_token_ids_d_t.index_select(0, rows).to(torch::kLong);
-        auto steps  = torch::arange(static_cast<int64_t>(propose_step_), rows.options()).unsqueeze(0);
-        draft_token_probs_d_t.index_fill_(0, rows, 0);
-        draft_token_probs_d_t.index_put_({rows.unsqueeze(1), steps, tokens}, 1.0f);
-    }
-
     {
         RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample.execRejectionSampling");
         execRejectionSampling({

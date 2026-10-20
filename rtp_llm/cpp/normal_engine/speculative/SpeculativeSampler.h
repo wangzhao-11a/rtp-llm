@@ -52,11 +52,6 @@ struct SpeculativeSamplingParams {
     torch::Tensor do_sample;
     torch::Tensor force_accept;  // CPU bool [B].
     std::vector<at::Generator> generators;
-    /** Optional CPU int64 row indices for point-mass candidates within a dense-q batch.
-     * Their q rows are scratch space: batchSample fills target-vocab one-hot in place after
-     * d2t mapping. PP supplies a per-call GPU upload, so this never overwrites stream-owned q.
-     * Undefined keeps the existing all-dense or implicit all-point-mass path. */
-    torch::Tensor draft_point_mass_rows;
 };
 
 class SpeculativeSampler {
