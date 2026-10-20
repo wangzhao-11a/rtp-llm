@@ -90,15 +90,18 @@ TEST_F(PPSerializationTest, PlanDecodingCopiesTensorsToPinnedCpuWithoutAliasingP
     expect_host_copy(forwarded.model_input.multimodal_features->front(), plan.model_input.multimodal_features->front());
 }
 
-TEST_F(PPSerializationTest, ExecutionResultDecodingKeepsCudaPayloadsOnPinnedCpu) {
+TEST_F(PPSerializationTest, ExecutionResultDecodingOwnsPinnedCpuRequestOutputs) {
     PPExecutionResult result;
     result.request_ids = torch::tensor({101}, torch::kInt64);
-    result.new_token_ids = torch::tensor({7}, torch::kInt32).reshape({1, 1});
-    result.hidden_states = torch::arange(8, torch::kFloat32).reshape({2, 4}).cuda();
+    result.new_token_ids     = torch::tensor({7, 8}, torch::kInt32).reshape({2, 1});
+    result.new_token_lengths = torch::ones({2}, torch::kInt32);
+    result.request_errors.resize(1);
+    result.request_outputs.resize(1);
+    result.request_outputs[0].hidden_states = torch::arange(8, torch::kFloat32).reshape({2, 4});
     PromptLogitsOutput prompt_logits;
-    prompt_logits.topk_token_ids = torch::tensor({{2, 3}}, torch::kInt32).cuda();
-    prompt_logits.topk_logprobs = torch::tensor({{-0.2f, -1.7f}}).cuda();
-    result.prompt_logits = {prompt_logits};
+    prompt_logits.topk_token_ids            = torch::tensor({{2, 3}}, torch::kInt32);
+    prompt_logits.topk_logprobs             = torch::tensor({{-0.2f, -1.7f}});
+    result.request_outputs[0].prompt_logits = prompt_logits;
 
     const auto received =
         pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
@@ -106,19 +109,24 @@ TEST_F(PPSerializationTest, ExecutionResultDecodingKeepsCudaPayloadsOnPinnedCpu)
     EXPECT_TRUE(received.new_token_ids.device().is_cpu());
     EXPECT_TRUE(torch::equal(received.request_ids, result.request_ids));
     EXPECT_TRUE(torch::equal(received.new_token_ids, result.new_token_ids));
-    EXPECT_TRUE(received.hidden_states.is_cpu());
-    EXPECT_TRUE(received.hidden_states.is_pinned());
-    EXPECT_EQ(received.hidden_states.scalar_type(), result.hidden_states.scalar_type());
-    EXPECT_EQ(received.hidden_states.sizes().vec(), result.hidden_states.sizes().vec());
-    EXPECT_TRUE(torch::equal(received.hidden_states, result.hidden_states.cpu()));
-    ASSERT_EQ(received.prompt_logits.size(), 1u);
-    ASSERT_TRUE(received.prompt_logits.front().has_value());
-    EXPECT_TRUE(received.prompt_logits.front()->topk_token_ids.is_cpu());
-    EXPECT_TRUE(received.prompt_logits.front()->topk_logprobs.is_cpu());
-    EXPECT_TRUE(received.prompt_logits.front()->topk_token_ids.is_pinned());
-    EXPECT_TRUE(received.prompt_logits.front()->topk_logprobs.is_pinned());
-    EXPECT_TRUE(torch::equal(received.prompt_logits.front()->topk_token_ids, prompt_logits.topk_token_ids.cpu()));
-    EXPECT_TRUE(torch::equal(received.prompt_logits.front()->topk_logprobs, prompt_logits.topk_logprobs.cpu()));
+    EXPECT_TRUE(received.request_outputs[0].hidden_states.is_cpu());
+    EXPECT_TRUE(received.request_outputs[0].hidden_states.is_pinned());
+    EXPECT_EQ(received.request_outputs[0].hidden_states.scalar_type(),
+              result.request_outputs[0].hidden_states.scalar_type());
+    EXPECT_EQ(received.request_outputs[0].hidden_states.sizes().vec(),
+              result.request_outputs[0].hidden_states.sizes().vec());
+    EXPECT_TRUE(torch::equal(received.request_outputs[0].hidden_states, result.request_outputs[0].hidden_states));
+    EXPECT_NE(received.request_outputs[0].hidden_states.data_ptr(), result.request_outputs[0].hidden_states.data_ptr());
+    ASSERT_EQ(received.request_outputs.size(), 1u);
+    ASSERT_TRUE(received.request_outputs.front().prompt_logits.has_value());
+    EXPECT_TRUE(received.request_outputs.front().prompt_logits->topk_token_ids.is_cpu());
+    EXPECT_TRUE(received.request_outputs.front().prompt_logits->topk_logprobs.is_cpu());
+    EXPECT_TRUE(received.request_outputs.front().prompt_logits->topk_token_ids.is_pinned());
+    EXPECT_TRUE(received.request_outputs.front().prompt_logits->topk_logprobs.is_pinned());
+    EXPECT_TRUE(
+        torch::equal(received.request_outputs.front().prompt_logits->topk_token_ids, prompt_logits.topk_token_ids));
+    EXPECT_TRUE(
+        torch::equal(received.request_outputs.front().prompt_logits->topk_logprobs, prompt_logits.topk_logprobs));
 }
 
 TEST_F(PPSerializationTest, ResultRoundTripPreservesMixedRequestErrors) {
@@ -152,7 +160,7 @@ TEST_F(PPSerializationTest, PrefillOnlyPlanAndPlaceholderTokensSurviveTransport)
     result.new_token_ids = torch::zeros({2, 1}, torch::kInt32);
     result.new_token_lengths = torch::ones({2}, torch::kInt32);
     result.request_errors.resize(2);
-    result.prompt_logits.resize(2);
+    result.request_outputs.resize(2);
     const auto received =
         pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
     ASSERT_TRUE(received.new_token_ids.defined());
@@ -163,7 +171,7 @@ TEST_F(PPSerializationTest, PrefillOnlyPlanAndPlaceholderTokensSurviveTransport)
     EXPECT_TRUE(torch::equal(received.new_token_lengths, result.new_token_lengths));
     EXPECT_TRUE(torch::equal(received.request_ids, result.request_ids));
     EXPECT_EQ(received.request_errors.size(), 2u);
-    EXPECT_EQ(received.prompt_logits.size(), 2u);
+    EXPECT_EQ(received.request_outputs.size(), 2u);
     EXPECT_FALSE(received.propose_token_ids.defined());
 }
 
@@ -171,10 +179,12 @@ TEST_F(PPSerializationTest, ResultWireLayoutOmitsSourceDevice) {
     PPExecutionResult result;
     result.sample_input_us = 1234567890123;
     result.request_ids = torch::tensor({101, 202}, torch::kInt64);
+    result.request_outputs.resize(2);
+    result.request_errors.resize(2);
 
     /** Fix the protocol layout independently of the shared read/write field traversal. */
     std::vector<uint8_t> expected;
-    appendWireValue<uint32_t>(expected, 23);
+    appendWireValue<uint32_t>(expected, 24);
     appendWireValue<int64_t>(expected, 1234567890123);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<uint8_t>(expected, 1);
@@ -183,10 +193,13 @@ TEST_F(PPSerializationTest, ResultWireLayoutOmitsSourceDevice) {
     appendWireValue<uint64_t>(expected, 16);
     appendWireValue<int64_t>(expected, 101);
     appendWireValue<int64_t>(expected, 202);
-    /** The remaining 12 result tensors are undefined; both output lists are empty. */
-    expected.insert(expected.end(), 12, uint8_t{0});
-    appendWireValue<uint64_t>(expected, 0);
-    appendWireValue<uint64_t>(expected, 0);
+    /** Requests without optional outputs still occupy a slot in the result. */
+    expected.insert(expected.end(), 5, uint8_t{0});
+    appendWireValue<uint64_t>(expected, 2);
+    expected.insert(expected.end(), 16, uint8_t{0});
+    appendWireValue<uint64_t>(expected, 2);
+    appendWireValue<int32_t>(expected, static_cast<int32_t>(ErrorCode::NONE_ERROR));
+    appendWireValue<int32_t>(expected, static_cast<int32_t>(ErrorCode::NONE_ERROR));
     const auto payload = torch::tensor(expected, torch::kUInt8);
 
     EXPECT_TRUE(torch::equal(pp_serialization::serializeExecutionResult(result), payload));
@@ -194,8 +207,8 @@ TEST_F(PPSerializationTest, ResultWireLayoutOmitsSourceDevice) {
     EXPECT_EQ(received.sample_input_us, result.sample_input_us);
     EXPECT_TRUE(torch::equal(received.request_ids, result.request_ids));
     EXPECT_FALSE(received.new_token_ids.defined());
-    EXPECT_TRUE(received.prompt_logits.empty());
-    EXPECT_TRUE(received.request_errors.empty());
+    EXPECT_EQ(received.request_outputs.size(), 2u);
+    EXPECT_EQ(received.request_errors.size(), 2u);
 
     result.request_ids = result.request_ids.cuda();
     EXPECT_TRUE(torch::equal(pp_serialization::serializeExecutionResult(result), payload));
@@ -208,7 +221,7 @@ TEST_F(PPSerializationTest, MetadataOnlyPlanWireLayoutKeepsShutdownInHeader) {
     plan.finished_request_ids = {101};
 
     std::vector<uint8_t> expected;
-    appendWireValue<uint32_t>(expected, 23);
+    appendWireValue<uint32_t>(expected, 24);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<uint64_t>(expected, 2);
@@ -226,7 +239,7 @@ TEST_F(PPSerializationTest, MetadataOnlyPlanWireLayoutKeepsShutdownInHeader) {
 }
 
 TEST_F(PPSerializationTest, PreviousProtocolVersionIsRejectedForEveryMessageType) {
-    const uint32_t old_version = 22;
+    const uint32_t old_version = 23;
     for (bool metadata_only : {false, true}) {
         auto payload = pp_serialization::serializePlan(PPExecutionPlan{}, metadata_only);
         std::memcpy(payload.data_ptr(), &old_version, sizeof(old_version));
@@ -332,7 +345,7 @@ TEST_F(PPSerializationTest, MixedReturnSequencesPlanAndResultRoundTrip) {
     result.new_token_ids     = torch::tensor({{10}, {11}, {12}}, torch::kInt32);
     result.new_token_lengths = torch::ones({3}, torch::kInt32);
     result.request_errors.resize(2);
-    result.prompt_logits.resize(2);
+    result.request_outputs.resize(2);
 
     const auto round_trip_result =
         pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
@@ -356,7 +369,7 @@ TEST_F(PPSerializationTest, NextVerificationCandidatesRoundTripWithOptionalMtpHa
         result.new_token_ids     = torch::tensor({{10}, {11}}, torch::kInt32);
         result.new_token_lengths = torch::ones({2}, torch::kInt32);
         result.request_errors.resize(2);
-        result.prompt_logits.resize(2);
+        result.request_outputs.resize(2);
         if (mtp_handoff) {
             /** MTP/EAGLE PD prefill carries one candidate and the state needed by a non-PP D. */
             result.propose_token_ids          = torch::tensor({{20}, {22}}, torch::kInt32);
@@ -384,31 +397,58 @@ TEST_F(PPSerializationTest, NextVerificationCandidatesRoundTripWithOptionalMtpHa
     }
 }
 
-TEST_F(PPSerializationTest, PlanRoundTripPreservesPromptLogitsAndHiddenStatesConfig) {
+TEST_F(PPSerializationTest, PlanRoundTripPreservesBatchAndRequestOutputRequirements) {
     PPExecutionPlan plan;
     plan.model_input.custom_output_indexes = torch::tensor({1, 3}, torch::kInt64);
     plan.model_input.kv_cache_group_tags    = {"full", "linear"};
     plan.model_input.need_all_logits        = true;
     plan.model_input.need_all_hidden_states = true;
+    plan.output_config.return_logits            = true;
+    plan.output_config.return_softmax_probs     = true;
+    plan.output_config.return_cum_log_probs     = true;
+    plan.output_config.return_all_probs         = ReturnAllProbsMode::ORIGINAL;
     plan.output_config.return_hidden_states = true;
     plan.output_config.return_all_hidden_states = true;
-    plan.output_config.prompt_logits_requests = {PPPromptLogitsRequest{true, 2, 1, 3, true}, PPPromptLogitsRequest{}};
+    plan.output_config.requests.resize(2);
+    plan.output_config.requests[0].return_logits            = true;
+    plan.output_config.requests[0].return_softmax_probs     = true;
+    plan.output_config.requests[0].return_cum_log_probs     = true;
+    plan.output_config.requests[0].return_all_probs         = true;
+    plan.output_config.requests[0].return_hidden_states     = true;
+    plan.output_config.requests[0].return_all_hidden_states = true;
+    plan.output_config.requests[0].prompt_logits            = {true, 2, 1, 3, true};
 
     const auto round_trip = pp_serialization::deserializePlan(pp_serialization::serializePlan(plan, false));
     EXPECT_TRUE(torch::equal(round_trip.model_input.custom_output_indexes, plan.model_input.custom_output_indexes));
     EXPECT_EQ(round_trip.model_input.kv_cache_group_tags, plan.model_input.kv_cache_group_tags);
     EXPECT_TRUE(round_trip.model_input.need_all_logits);
     EXPECT_TRUE(round_trip.model_input.need_all_hidden_states);
+    EXPECT_TRUE(round_trip.output_config.return_logits);
+    EXPECT_TRUE(round_trip.output_config.return_softmax_probs);
+    EXPECT_TRUE(round_trip.output_config.return_cum_log_probs);
+    EXPECT_EQ(round_trip.output_config.return_all_probs, ReturnAllProbsMode::ORIGINAL);
+    EXPECT_FALSE(round_trip.output_config.calculate_loss);
     EXPECT_TRUE(round_trip.output_config.return_hidden_states);
     EXPECT_TRUE(round_trip.output_config.return_all_hidden_states);
-    ASSERT_EQ(round_trip.output_config.prompt_logits_requests.size(), 2u);
-    const auto& request = round_trip.output_config.prompt_logits_requests[0];
+    ASSERT_EQ(round_trip.output_config.requests.size(), 2u);
+    for (auto flag : {&PPRequestOutputConfig::return_logits,
+                      &PPRequestOutputConfig::return_softmax_probs,
+                      &PPRequestOutputConfig::return_cum_log_probs,
+                      &PPRequestOutputConfig::return_all_probs,
+                      &PPRequestOutputConfig::return_hidden_states,
+                      &PPRequestOutputConfig::return_all_hidden_states}) {
+        EXPECT_TRUE(round_trip.output_config.requests[0].*flag);
+        EXPECT_FALSE(round_trip.output_config.requests[1].*flag);
+    }
+    EXPECT_FALSE(round_trip.output_config.requests[0].calculate_loss);
+    EXPECT_FALSE(round_trip.output_config.requests[1].calculate_loss);
+    const auto& request = round_trip.output_config.requests[0].prompt_logits;
     EXPECT_TRUE(request.enabled);
     EXPECT_EQ(request.top_k, 2);
     EXPECT_EQ(request.start, 1);
     EXPECT_EQ(request.end, 3);
     EXPECT_TRUE(request.return_target_logprob);
-    EXPECT_FALSE(round_trip.output_config.prompt_logits_requests[1].enabled);
+    EXPECT_FALSE(round_trip.output_config.requests[1].prompt_logits.enabled);
 }
 
 TEST_F(PPSerializationTest, ResultRoundTripPreservesPromptLogitsAndHiddenStates) {
@@ -416,29 +456,33 @@ TEST_F(PPSerializationTest, ResultRoundTripPreservesPromptLogitsAndHiddenStates)
     result.request_ids = torch::tensor({301, 302}, torch::kInt64);
     result.new_token_ids = torch::tensor({{10}, {11}}, torch::kInt32);
     result.new_token_lengths = torch::ones({2}, torch::kInt32);
-    result.hidden_states = torch::tensor({{5.0f, 6.0f}, {9.0f, 10.0f}});
-    result.all_hidden_states = torch::arange(10, torch::kFloat32).reshape({5, 2});
+    result.request_outputs.resize(2);
+    result.request_outputs[0].hidden_states     = torch::tensor({{5.0f, 6.0f}});
+    result.request_outputs[0].all_hidden_states = torch::arange(6, torch::kFloat32).reshape({3, 2});
+    result.request_outputs[1].hidden_states     = torch::tensor({{9.0f, 10.0f}});
     result.request_errors.resize(2);
-    result.prompt_logits.resize(2);
     PromptLogitsOutput prompt_logits;
     prompt_logits.topk_logprobs = torch::tensor({{-0.2f, -1.7f}, {-0.3f, -1.4f}});
     prompt_logits.topk_token_ids = torch::tensor({{2, 3}, {4, 5}}, torch::kInt32);
     prompt_logits.target_logprobs = torch::tensor({-0.3f});
     prompt_logits.start_pos = 1;
     prompt_logits.end_pos = 3;
-    result.prompt_logits[0] = prompt_logits;
+    result.request_outputs[0].prompt_logits = prompt_logits;
 
     const auto round_trip =
         pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
     EXPECT_EQ(round_trip.sample_input_us, 0);
     EXPECT_TRUE(torch::equal(round_trip.request_ids, result.request_ids));
     EXPECT_TRUE(torch::equal(round_trip.new_token_ids, result.new_token_ids));
-    EXPECT_TRUE(torch::equal(round_trip.hidden_states, result.hidden_states));
-    EXPECT_TRUE(torch::equal(round_trip.all_hidden_states, result.all_hidden_states));
-    ASSERT_EQ(round_trip.prompt_logits.size(), 2u);
-    ASSERT_TRUE(round_trip.prompt_logits[0].has_value());
-    EXPECT_FALSE(round_trip.prompt_logits[1].has_value());
-    const auto& received = round_trip.prompt_logits[0].value();
+    EXPECT_TRUE(torch::equal(round_trip.request_outputs[0].hidden_states, result.request_outputs[0].hidden_states));
+    EXPECT_TRUE(
+        torch::equal(round_trip.request_outputs[0].all_hidden_states, result.request_outputs[0].all_hidden_states));
+    EXPECT_TRUE(torch::equal(round_trip.request_outputs[1].hidden_states, result.request_outputs[1].hidden_states));
+    EXPECT_FALSE(round_trip.request_outputs[1].all_hidden_states.defined());
+    ASSERT_EQ(round_trip.request_outputs.size(), 2u);
+    ASSERT_TRUE(round_trip.request_outputs[0].prompt_logits.has_value());
+    EXPECT_FALSE(round_trip.request_outputs[1].prompt_logits.has_value());
+    const auto& received = round_trip.request_outputs[0].prompt_logits.value();
     EXPECT_TRUE(torch::equal(received.topk_logprobs, prompt_logits.topk_logprobs));
     EXPECT_TRUE(torch::equal(received.topk_token_ids, prompt_logits.topk_token_ids));
     EXPECT_TRUE(torch::equal(received.target_logprobs, prompt_logits.target_logprobs));
@@ -446,4 +490,34 @@ TEST_F(PPSerializationTest, ResultRoundTripPreservesPromptLogitsAndHiddenStates)
     EXPECT_EQ(received.end_pos, prompt_logits.end_pos);
 }
 
+TEST_F(PPSerializationTest, RequestViewsSerializeOnlySelectedElementsAndKeepEmptySlots) {
+    PPExecutionResult result;
+    result.request_ids       = torch::tensor({101, 202, 303}, torch::kInt64);
+    result.new_token_ids     = torch::tensor({10, 11, 12, 13}, torch::kInt32).reshape({4, 1});
+    result.new_token_lengths = torch::ones({4}, torch::kInt32);
+    result.request_errors.resize(3);
+    result.request_outputs.resize(3);
+    const auto batch_logits   = torch::arange(512, torch::kFloat32).reshape({4, 128});
+    const auto batch_hidden   = torch::arange(64, torch::kFloat32).reshape({4, 16});
+    auto&      output         = result.request_outputs[1];
+    output.logits             = batch_logits.narrow(0, 1, 2);
+    output.hidden_states      = batch_hidden.narrow(0, 1, 2);
+    const auto sparse_payload = pp_serialization::serializeExecutionResult(result);
+    const auto received       = pp_serialization::deserializeExecutionResult(sparse_payload);
+    ASSERT_EQ(received.request_outputs.size(), 3u);
+    EXPECT_TRUE(torch::equal(received.request_ids, result.request_ids));
+    EXPECT_TRUE(torch::equal(received.request_outputs[1].logits, batch_logits.narrow(0, 1, 2)));
+    EXPECT_TRUE(torch::equal(received.request_outputs[1].hidden_states, batch_hidden.narrow(0, 1, 2)));
+    EXPECT_EQ(received.request_outputs[1].logits.storage().nbytes(), 2 * 128 * sizeof(float));
+    EXPECT_EQ(received.request_outputs[1].hidden_states.storage().nbytes(), 2 * 16 * sizeof(float));
+    for (auto index : {0, 2}) {
+        EXPECT_FALSE(received.request_outputs[index].logits.defined());
+        EXPECT_FALSE(received.request_outputs[index].hidden_states.defined());
+    }
+
+    output.logits              = output.logits.clone();
+    output.hidden_states       = output.hidden_states.clone();
+    const auto compact_payload = pp_serialization::serializeExecutionResult(result);
+    EXPECT_TRUE(torch::equal(sparse_payload, compact_payload));
+}
 }

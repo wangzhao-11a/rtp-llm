@@ -1440,8 +1440,11 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
         outputs.all_hidden_states = hidden;
         if (need_all_logits) {
             RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(need_all_logits_index)");
-            outputs.all_logits = logits;
-            outputs.logits     = torch::index_select(logits, 0, lm_output_indexes_device.to(torch::kLong));
+            const auto output_indexes = lm_output_indexes_device.to(torch::kLong);
+            outputs.all_logits        = logits;
+            outputs.logits            = torch::index_select(logits, 0, output_indexes);
+            /** Prompt scoring expands LM-head rows, but hidden_states must retain the same selected rows as logits. */
+            outputs.hidden_states = torch::index_select(hidden, 0, output_indexes);
         } else if (merged_eagle3_hidden.defined()) {
             outputs.all_hidden_states = merged_eagle3_hidden;
         }

@@ -76,7 +76,6 @@ private:
                                                   int64_t                              stream_idx,
                                                   int64_t                              sequence_offset) const;
 
-    /** Softmax uses compact token ids, so call this before mapping output vocabulary ids. */
     void fillOptionalOutputs(const PPExecutionPlan& plan,
                              const GptModelOutputs& model_output,
                              const SamplerOutput&   sampler_output,
@@ -94,11 +93,7 @@ private:
                                     const PPExecutionResult& result,
                                     int64_t                  stream_idx,
                                     int64_t                  batch_idx,
-                                    int64_t                  stream_batch_size,
-                                    int64_t                  token_offset,
-                                    int64_t                  token_size,
-                                    int64_t                  loss_offset,
-                                    int64_t                  loss_size) const;
+                                    int64_t                  stream_batch_size) const;
 
     absl::Status dispatchSpeculativeExecutionResult(const StreamGroups& stream_groups,
                                                    const PPExecutionResult& result) const;

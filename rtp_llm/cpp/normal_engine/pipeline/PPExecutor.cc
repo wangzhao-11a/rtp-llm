@@ -716,7 +716,6 @@ void PPExecutor::advanceSamplingStates(const PPSamplingPlan& sampling_plan, PPEx
     const auto* input_lengths    = sampling_plan.input_lengths.data_ptr<int32_t>();
     const auto* sequence_lengths = sampling_plan.sequence_lengths.data_ptr<int32_t>();
     const auto* max_tokens       = sampling_plan.max_tokens.data_ptr<int32_t>();
-    const auto& cum_log_probs    = result.cum_log_probs;
     int64_t     batch_idx        = 0;
     for (int64_t stream_idx = 0; stream_idx < stream_count; ++stream_idx) {
         const int64_t stream_batch_size = std::max<int32_t>(sampling_plan.num_return_sequences[stream_idx], 1);
@@ -756,10 +755,15 @@ void PPExecutor::advanceSamplingStates(const PPSamplingPlan& sampling_plan, PPEx
                 }
             }
         }
+        /**
+         * PP does not support beam search, so cumulative scores do not affect token selection.
+         * Only requests returning those scores need them retained across steps.
+         */
+        const auto& cum_log_probs = result.request_outputs[stream_idx].cum_log_probs;
         if (error.has_value()) {
             result.request_errors[stream_idx] = std::move(error.value());
         } else if (cum_log_probs.defined()) {
-            state.cum_log_probs.copy_(cum_log_probs.narrow(0, batch_idx, stream_batch_size));
+            state.cum_log_probs.copy_(cum_log_probs);
         }
         batch_idx += stream_batch_size;
     }
@@ -901,7 +905,7 @@ void PPExecutor::sampleTokens(const PPExecutionPlan& plan,
     const auto stream_count = plan.sampling_plan.request_ids.size(0);
     result.request_ids      = plan.sampling_plan.request_ids.to(torch::kCPU).contiguous();
     result.request_errors.assign(stream_count, ErrorInfo::OkStatus());
-    result.prompt_logits.resize(stream_count);
+    result.request_outputs.resize(stream_count);
     if (plan.model_input.is_fake_stream || plan.model_input.skip_lm_head) {
         /** Supply target-result shapes for the draft chain without creating request sampling state. */
         const auto token_count   = static_cast<int64_t>(sp_enabled_ && plan.is_decode ? propose_step_ + 1 : 1);

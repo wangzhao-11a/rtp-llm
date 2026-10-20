@@ -64,7 +64,22 @@ struct PPPromptLogitsRequest {
     bool return_target_logprob = true;
 };
 
-/** Output configuration for the lm-head stage. */
+struct PPRequestOutputConfig {
+    bool return_logits            = false;
+    bool return_softmax_probs     = false;
+    bool return_cum_log_probs     = false;
+    bool calculate_loss           = false;
+    bool return_hidden_states     = false;
+    bool return_all_hidden_states = false;
+    bool return_all_probs         = false;
+
+    PPPromptLogitsRequest prompt_logits;
+};
+
+/**
+ * The first stage aggregates requirements for batch computation and D2H copies.
+ * Per-request flags determine which output slices are returned.
+ */
 struct PPOutputConfig {
     bool               return_logits            = false;
     bool               return_softmax_probs     = false;
@@ -74,8 +89,8 @@ struct PPOutputConfig {
     bool               return_all_hidden_states = false;
     ReturnAllProbsMode return_all_probs         = ReturnAllProbsMode::NONE;
 
-    /** Per-stream configuration, aligned with PPSamplingPlan::request_ids. */
-    std::vector<PPPromptLogitsRequest> prompt_logits_requests;
+    /** Aligned with PPSamplingPlan::request_ids. */
+    std::vector<PPRequestOutputConfig> requests;
 };
 
 struct PPExecutionPlan {
@@ -86,6 +101,19 @@ struct PPExecutionPlan {
 
     bool          is_decode = false;        // Request phase; verify may use a prefill input shape
     torch::Tensor draft_next_position_ids;  // [stream_count * position_id_len_factor], MTP prefill
+};
+
+/** CPU outputs for one request; unrequested fields remain undefined. */
+struct PPRequestOutput {
+    torch::Tensor logits;            /** [request_batch_size, vocab_size] */
+    torch::Tensor softmax_probs;     /** [request_batch_size, new_token_count] */
+    torch::Tensor cum_log_probs;     /** [request_batch_size] */
+    torch::Tensor all_probs;         /** [request_batch_size, vocab_size] */
+    torch::Tensor loss;              /** [loss_token_count], shared by return sequences */
+    torch::Tensor hidden_states;     /** [request_batch_size, hidden_size] */
+    torch::Tensor all_hidden_states; /** [request_executed_token_count, hidden_size] */
+
+    std::optional<PromptLogitsOutput> prompt_logits;
 };
 
 /** Final outputs produced by the lm-head stage TP root. */
@@ -99,17 +127,8 @@ struct PPExecutionResult {
     /** Committed prefix length per row in new_token_ids, before applying the request length limit: CPU int32 [B].*/
     torch::Tensor new_token_lengths;
 
-    torch::Tensor logits;         // optional [total_batch_size, vocab_size]
-    torch::Tensor softmax_probs;  // optional [total_batch_size, 1], or [B, K+1] aligned with verify new_token_ids
-    torch::Tensor cum_log_probs;  // optional [total_batch_size]
-    torch::Tensor all_probs;      // optional [total_batch_size, vocab_size]
-
-    torch::Tensor loss;  // optional [loss_token_count]
-
-    torch::Tensor hidden_states;      // optional [total_batch_size, hidden_size]
-    torch::Tensor all_hidden_states;  // optional [executed_token_count, hidden_size]
-
-    std::vector<std::optional<PromptLogitsOutput>> prompt_logits;  // [stream_count]
+    /** One slot per request_id, including requests with no optional output or with errors. */
+    std::vector<PPRequestOutput> request_outputs;
 
     /** First error per request; failed-row placeholders are not committed. */
     std::vector<ErrorInfo> request_errors;

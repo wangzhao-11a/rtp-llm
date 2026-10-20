@@ -177,30 +177,36 @@ PPSamplingPlan PPBatchStreamProcessor::gatherSamplingPlan(const StreamGroups& st
 
 PPOutputConfig PPBatchStreamProcessor::gatherOutputConfig(const StreamGroups& stream_groups) const {
     PPOutputConfig output_config;
-    output_config.return_all_probs = stream_groups.needReturnAllProbs();
-    const auto all_streams         = stream_groups.allStreams();
-    output_config.prompt_logits_requests.reserve(all_streams.size());
+    if (!sp_enabled_) {
+        output_config.return_all_probs = stream_groups.needReturnAllProbs();
+    }
+    const auto all_streams = stream_groups.allStreams();
+    output_config.requests.reserve(all_streams.size());
     for (const auto& stream : all_streams) {
         const auto& config = *stream->generateConfig();
-        output_config.return_logits |= stream->returnLogits();
-        output_config.return_softmax_probs |= stream->calculateSoftmaxProbs();
-        output_config.return_cum_log_probs |= stream->returnCumLogProbs();
-        output_config.calculate_loss |= stream->calculateLoss();
-        output_config.return_hidden_states |= config.return_hidden_states;
-        output_config.return_all_hidden_states |= stream->needReturnHiddenStates();
-        output_config.prompt_logits_requests.push_back(PPPromptLogitsRequest{config.return_prompt_logits,
-                                                                             config.prompt_logits_top_k,
-                                                                             config.prompt_logits_start,
-                                                                             config.prompt_logits_end,
-                                                                             config.return_target_logprob});
-    }
-    if (sp_enabled_) {
-        /** SP commits a variable number of tokens per step, so these per-step outputs are undefined; disable them. */
-        output_config.return_logits            = false;
-        output_config.return_hidden_states     = false;
-        output_config.return_all_hidden_states = false;
-        output_config.return_cum_log_probs     = false;
-        output_config.return_all_probs         = ReturnAllProbsMode::NONE;
+        PPRequestOutputConfig request;
+        /** SP verify rows include rejected tokens; these outputs require alignment with committed tokens. */
+        if (!sp_enabled_) {
+            request.return_logits            = stream->returnLogits();
+            request.return_hidden_states     = config.return_hidden_states;
+            request.return_all_hidden_states = stream->needReturnHiddenStates();
+            request.return_cum_log_probs     = stream->returnCumLogProbs();
+            request.return_all_probs         = stream->getReturnAllProbs() != ReturnAllProbsMode::NONE;
+        }
+        request.return_softmax_probs = stream->calculateSoftmaxProbs();
+        request.calculate_loss       = stream->calculateLoss();
+        request.prompt_logits        = {config.return_prompt_logits,
+                                        config.prompt_logits_top_k,
+                                        config.prompt_logits_start,
+                                        config.prompt_logits_end,
+                                        config.return_target_logprob};
+        output_config.return_logits |= request.return_logits;
+        output_config.return_softmax_probs |= request.return_softmax_probs;
+        output_config.return_cum_log_probs |= request.return_cum_log_probs;
+        output_config.calculate_loss |= request.calculate_loss;
+        output_config.return_hidden_states |= request.return_hidden_states;
+        output_config.return_all_hidden_states |= request.return_all_hidden_states;
+        output_config.requests.push_back(std::move(request));
     }
     return output_config;
 }
@@ -586,7 +592,6 @@ void PPBatchStreamProcessor::fillExecutionResult(const PPExecutionPlan& plan,
                                                 const GptModelOutputs& model_output,
                                                 const SamplerOutput&   sampler_output,
                                                 PPExecutionResult&     result) const {
-    const auto  stream_count     = plan.sampling_plan.request_ids.size(0);
     const auto  total_batch_size = plan.sampling_plan.token_ids.size(0);
     const auto& token_ids        = sampler_output.token_ids;
     RTP_LLM_CHECK_WITH_INFO(token_ids.defined() && token_ids.dim() == 2 && token_ids.size(0) == total_batch_size
@@ -613,53 +618,6 @@ void PPBatchStreamProcessor::fillExecutionResult(const PPExecutionPlan& plan,
                          sampler_output.processor_errors,
                          sampler_output.success.to(torch::kCPU).contiguous(),
                          result.request_errors);
-
-    /** Prompt loss and prompt logits are stream-level; return sequences share the first batch row.
-     * Only prefill produces them, and PPScheduler never mixes prefill with decode. */
-    if (plan.model_input.need_all_logits && !plan.is_decode) {
-        const auto lm_output_indexes = plan.model_input.lm_output_indexes.to(torch::kCPU, torch::kInt64).contiguous();
-        RTP_LLM_CHECK(lm_output_indexes.numel() == total_batch_size);
-        const auto*                indexes = lm_output_indexes.data_ptr<int64_t>();
-        std::vector<torch::Tensor> losses;
-        losses.reserve(stream_count);
-        int64_t batch_idx = 0;
-        for (int64_t stream_idx = 0; stream_idx < stream_count; ++stream_idx) {
-            const int64_t stream_batch_size = std::max(plan.sampling_plan.num_return_sequences[stream_idx], 1);
-            const int64_t start             = batch_idx == 0 ? 0 : indexes[batch_idx - 1] + 1;
-            const int64_t end               = indexes[batch_idx] + 1;
-            const int64_t token_size        = end - start;
-            const int64_t loss_size         = token_size - 1;
-            if (plan.output_config.calculate_loss && loss_size > 0) {
-                auto labels = plan.model_input.combo_tokens.narrow(0, start + 1, loss_size)
-                                  .to(model_output.all_logits.device(), torch::kLong);
-                losses.push_back(torch::cross_entropy_loss(model_output.all_logits.narrow(0, start, loss_size),
-                                                           labels,
-                                                           torch::nullopt,
-                                                           at::Reduction::None)
-                                     .to(torch::kFloat32));
-            }
-
-            const auto& prompt_request = plan.output_config.prompt_logits_requests[stream_idx];
-            if (prompt_request.enabled) {
-                auto request_logits = model_output.all_logits.narrow(0, start, token_size);
-                auto request_tokens = plan.model_input.combo_tokens.narrow(0, start, token_size);
-                auto output         = makePromptLogitsOutput(request_logits,
-                                                     request_tokens,
-                                                     prompt_request.top_k,
-                                                     prompt_request.start,
-                                                     prompt_request.end,
-                                                     prompt_request.return_target_logprob);
-                if (output.has_value()) {
-                    result.prompt_logits[stream_idx] = std::move(output.value());
-                }
-            }
-            batch_idx += stream_batch_size;
-        }
-
-        if (plan.output_config.calculate_loss && !losses.empty()) {
-            result.loss = torch::cat(losses).to(torch::kCPU).contiguous();
-        }
-    }
 }
 
 void PPBatchStreamProcessor::fillExecutionResult(const PPExecutionPlan&                       plan,
@@ -680,7 +638,7 @@ void PPBatchStreamProcessor::fillExecutionResult(const PPExecutionPlan&         
     result.new_token_ids     = host_accepted.token_ids.contiguous();
     result.new_token_lengths = std::move(host_accepted.lengths);
     fillOptionalOutputs(plan, model_output, target_sampler_output, result);
-    /** Only the first accept_len rows produce committed tokens, so sampler failures after them are ignored. */
+    /** Sampler failures outside the committed token prefix do not fail the request. */
     const auto verify_success =
         target_sampler_output.success.to(torch::kCPU).reshape({total_batch_size, verify_token_count});
     const auto accepted_rows =
@@ -696,8 +654,16 @@ void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
                                                  const SamplerOutput&   sampler_output,
                                                  PPExecutionResult&     result) const {
     const auto& output_config = plan.output_config;
+    const auto  stream_count  = plan.sampling_plan.request_ids.size(0);
+    torch::Tensor logits;
+    torch::Tensor softmax_probs;
+    torch::Tensor hidden_states;
+    torch::Tensor all_hidden_states;
+    torch::Tensor cum_log_probs;
+    torch::Tensor all_probs;
     if (output_config.return_logits) {
-        result.logits = model_output.logits.to(torch::kCPU).contiguous();
+        /** FP32 contiguous logits can alias probs, whose CUDA softmax is in-place; the CPU copy preserves raw logits. */
+        logits = model_output.logits.to(torch::kCPU).contiguous();
     }
     if (output_config.return_softmax_probs) {
         auto probs = model_output.logits.to(torch::kFloat32).contiguous();
@@ -706,23 +672,84 @@ void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
 #else
         probs = torch::softmax(probs, -1);
 #endif
-        /** Logits rows follow new_token_ids in row-major order. */
         const auto& new_token_ids = result.new_token_ids;
         const auto  token_index   = new_token_ids.to(probs.device(), torch::kLong).reshape({probs.size(0), 1});
-        result.softmax_probs =
-            probs.gather(1, token_index).reshape(new_token_ids.sizes()).to(torch::kCPU).contiguous();
+        softmax_probs = probs.gather(1, token_index).reshape(new_token_ids.sizes()).to(torch::kCPU).contiguous();
     }
     if (output_config.return_hidden_states) {
-        result.hidden_states = model_output.hidden_states.to(torch::kCPU).contiguous();
+        hidden_states = model_output.hidden_states.to(torch::kCPU).contiguous();
     }
     if (output_config.return_all_hidden_states) {
-        result.all_hidden_states = model_output.all_hidden_states.to(torch::kCPU).contiguous();
+        all_hidden_states = model_output.all_hidden_states.to(torch::kCPU).contiguous();
     }
     if (output_config.return_cum_log_probs) {
-        result.cum_log_probs = sampler_output.cum_log_probs.to(torch::kCPU).contiguous();
+        cum_log_probs = sampler_output.cum_log_probs.to(torch::kCPU).contiguous();
     }
     if (output_config.return_all_probs != ReturnAllProbsMode::NONE) {
-        result.all_probs = sampler_output.all_probs.to(torch::kCPU).contiguous();
+        all_probs = sampler_output.all_probs.to(torch::kCPU).contiguous();
+    }
+
+    const bool    need_prompt_outputs = plan.model_input.need_all_logits && !plan.is_decode;
+    torch::Tensor lm_output_indexes;
+    if (output_config.return_all_hidden_states || need_prompt_outputs) {
+        lm_output_indexes = plan.model_input.lm_output_indexes.to(torch::kCPU, torch::kInt64).contiguous();
+    }
+
+    /** Request views share batch CPU storage; serialization includes only each view's elements. */
+    int64_t batch_idx = 0;
+    for (int64_t stream_idx = 0; stream_idx < stream_count; ++stream_idx) {
+        const auto& request           = output_config.requests[stream_idx];
+        auto&       output            = result.request_outputs[stream_idx];
+        const auto  stream_batch_size = std::max(plan.sampling_plan.num_return_sequences[stream_idx], 1);
+        if (request.return_logits) {
+            output.logits = logits.narrow(0, batch_idx, stream_batch_size);
+        }
+        if (request.return_softmax_probs) {
+            output.softmax_probs = softmax_probs.narrow(0, batch_idx, stream_batch_size);
+        }
+        if (request.return_cum_log_probs) {
+            output.cum_log_probs = cum_log_probs.narrow(0, batch_idx, stream_batch_size);
+        }
+        if (request.return_all_probs) {
+            output.all_probs = all_probs.narrow(0, batch_idx, stream_batch_size);
+        }
+        if (request.return_hidden_states) {
+            output.hidden_states = hidden_states.narrow(0, batch_idx, stream_batch_size);
+        }
+        if (request.return_all_hidden_states || need_prompt_outputs) {
+            const auto* indexes = lm_output_indexes.data_ptr<int64_t>();
+            const auto  start   = batch_idx == 0 ? 0 : indexes[batch_idx - 1] + 1;
+            if (request.return_all_hidden_states) {
+                const auto end           = indexes[batch_idx + stream_batch_size - 1] + 1;
+                output.all_hidden_states = all_hidden_states.narrow(0, start, end - start);
+            }
+            /** Return sequences share the prompt, so the first sequence suffices for loss and prompt logits. */
+            if (need_prompt_outputs) {
+                const auto token_size = indexes[batch_idx] + 1 - start;
+                const auto loss_size  = token_size - 1;
+                if (request.calculate_loss && loss_size > 0) {
+                    auto labels = plan.model_input.combo_tokens.narrow(0, start + 1, loss_size)
+                                      .to(model_output.all_logits.device(), torch::kLong);
+                    output.loss = torch::cross_entropy_loss(model_output.all_logits.narrow(0, start, loss_size),
+                                                            labels,
+                                                            torch::nullopt,
+                                                            at::Reduction::None)
+                                      .to(torch::kCPU, torch::kFloat32)
+                                      .contiguous();
+                }
+                const auto& prompt_request = request.prompt_logits;
+                if (prompt_request.enabled) {
+                    output.prompt_logits =
+                        makePromptLogitsOutput(model_output.all_logits.narrow(0, start, token_size),
+                                               plan.model_input.combo_tokens.narrow(0, start, token_size),
+                                               prompt_request.top_k,
+                                               prompt_request.start,
+                                               prompt_request.end,
+                                               prompt_request.return_target_logprob);
+                }
+            }
+        }
+        batch_idx += stream_batch_size;
     }
 }
 
@@ -746,8 +773,8 @@ void PPBatchStreamProcessor::validateExecutionResult(const StreamGroups&      st
                                 && result.request_ids.scalar_type() == torch::kInt64
                                 && result.request_ids.dim() == 1 && result.request_ids.size(0) == stream_count,
                             "PP execution result request count does not match the inflight stream count");
-    RTP_LLM_CHECK_WITH_INFO(result.prompt_logits.size() == static_cast<size_t>(stream_count),
-                            "PP prompt-logits result count does not match the inflight stream count");
+    RTP_LLM_CHECK_WITH_INFO(result.request_outputs.size() == static_cast<size_t>(stream_count),
+                            "PP optional-output count does not match the inflight stream count");
 
     RTP_LLM_CHECK_WITH_INFO(result.request_errors.size() == static_cast<size_t>(stream_count),
                             "PP request error counts do not match the inflight stream count");
@@ -776,45 +803,26 @@ absl::Status PPBatchStreamProcessor::dispatchNormalExecutionResult(const StreamG
                                                                    const PPExecutionResult& result) const {
     const auto all_streams = stream_groups.allStreams();
 
-    const auto* request_ids  = result.request_ids.data_ptr<int64_t>();
-    int64_t     batch_idx    = 0;
-    int64_t     stream_idx   = 0;
-    int64_t     token_offset = 0;
-    int64_t     loss_offset  = 0;
+    const auto* request_ids = result.request_ids.data_ptr<int64_t>();
+    int64_t     batch_idx   = 0;
+    int64_t     stream_idx  = 0;
     for (const auto& stream : all_streams) {
         RTP_LLM_CHECK_WITH_INFO(request_ids[stream_idx] == stream->streamId(),
                                 "PP execution result request order does not match the inflight stream order");
-        const auto stream_batch_size   = static_cast<int64_t>(stream->currentBatchSize());
-        const auto tokens_per_sequence = stream->isContextStream() ? stream->contextLength() : 1;
-        const auto token_size          = tokens_per_sequence * stream_batch_size;
-        const auto loss_size           = std::max<int64_t>(tokens_per_sequence - 1, 0);
-        dispatchNormalSingleStream(stream,
-                                   result,
-                                   stream_idx,
-                                   batch_idx,
-                                   stream_batch_size,
-                                   token_offset,
-                                   token_size,
-                                   loss_offset,
-                                   loss_size);
+        const auto stream_batch_size = static_cast<int64_t>(stream->currentBatchSize());
+        dispatchNormalSingleStream(stream, result, stream_idx, batch_idx, stream_batch_size);
         stream->clearPPInflight();
         ++stream_idx;
         batch_idx += stream_batch_size;
-        token_offset += token_size;
-        loss_offset += loss_size;
     }
     return absl::OkStatus();
 }
 
-void PPBatchStreamProcessor::dispatchNormalSingleStream(const GenerateStreamPtr&  stream,
-                                                        const PPExecutionResult&  result,
-                                                        int64_t                   stream_idx,
-                                                        int64_t                   batch_idx,
-                                                        int64_t                   stream_batch_size,
-                                                        int64_t                   token_offset,
-                                                        int64_t                   token_size,
-                                                        int64_t                   loss_offset,
-                                                        int64_t                   loss_size) const {
+void PPBatchStreamProcessor::dispatchNormalSingleStream(const GenerateStreamPtr& stream,
+                                                        const PPExecutionResult& result,
+                                                        int64_t                  stream_idx,
+                                                        int64_t                  batch_idx,
+                                                        int64_t                  stream_batch_size) const {
     const auto& error = result.request_errors[stream_idx];
     if (error.hasError()) {
         StreamUpdateInfo update_info{};
@@ -822,48 +830,20 @@ void PPBatchStreamProcessor::dispatchNormalSingleStream(const GenerateStreamPtr&
         stream->update(update_info, false);
         return;
     }
-    torch::Tensor hidden_states;
-    if (stream->generateConfig()->return_hidden_states) {
-        hidden_states = result.hidden_states.narrow(0, batch_idx, stream_batch_size).clone();
-    }
-    torch::Tensor logits;
-    if (stream->returnLogits()) {
-        logits = result.logits.narrow(0, batch_idx, stream_batch_size).clone();
-    }
-    torch::Tensor softmax_probs;
-    if (stream->calculateSoftmaxProbs()) {
-        softmax_probs = result.softmax_probs.narrow(0, batch_idx, stream_batch_size).clone();
-    }
-    torch::Tensor cum_log_probs;
-    if (stream->returnCumLogProbs()) {
-        cum_log_probs = result.cum_log_probs.narrow(0, batch_idx, stream_batch_size).clone();
-    }
-    torch::Tensor all_probs;
-    if (stream->getReturnAllProbs() != ReturnAllProbsMode::NONE) {
-        all_probs = result.all_probs.narrow(0, batch_idx, stream_batch_size).clone();
-    }
-    torch::Tensor loss;
-    if (stream->calculateLoss() && loss_size > 0) {
-        loss = result.loss.narrow(0, loss_offset, loss_size).clone();
-    }
-    torch::Tensor all_hidden_states;
-    if (stream->needReturnHiddenStates()) {
-        all_hidden_states = result.all_hidden_states.narrow(0, token_offset, token_size).clone();
-    }
-    auto prompt_logits = result.prompt_logits[stream_idx];
+    const auto& output = result.request_outputs[stream_idx];
     stream->update({result.new_token_ids.narrow(0, batch_idx, stream_batch_size),
                     1,
-                    std::move(hidden_states),
-                    std::move(logits),
-                    std::move(softmax_probs),
-                    std::move(cum_log_probs),
-                    std::move(all_probs),
-                    std::move(loss),
+                    output.hidden_states,
+                    output.logits,
+                    output.softmax_probs,
+                    output.cum_log_probs,
+                    output.all_probs,
+                    output.loss,
                     torch::Tensor(),
-                    std::move(all_hidden_states),
+                    output.all_hidden_states,
                     true,
                     false,
-                    std::move(prompt_logits),
+                    output.prompt_logits,
                     std::nullopt},
                    false);
 }

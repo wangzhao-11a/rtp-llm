@@ -142,7 +142,7 @@ protected:
         PPExecutionResult result;
         result.request_ids = torch::tensor(ids, torch::kInt64);
         result.request_errors.assign(ids.size(), ErrorInfo::OkStatus());
-        result.prompt_logits.resize(ids.size());
+        result.request_outputs.resize(ids.size());
         return result;
     }
 
@@ -285,7 +285,7 @@ TEST_F(PPBatchStreamProcessorTest, SamplingPlanCarriesSpeculativeFlagsPerRequest
     }
 }
 
-TEST_F(PPBatchStreamProcessorTest, OutputConfigCombinesFlagsAndKeepsPromptRequestsSeparate) {
+TEST_F(PPBatchStreamProcessorTest, OutputConfigAggregatesFlagsAndPreservesRequestRequirements) {
     auto first_config = config();
     first_config.return_logits            = true;
     first_config.return_hidden_states     = true;
@@ -298,7 +298,6 @@ TEST_F(PPBatchStreamProcessorTest, OutputConfigCombinesFlagsAndKeepsPromptReques
     auto second_config = config();
     second_config.return_softmax_probs = true;
     second_config.return_cum_log_probs = true;
-    second_config.calculate_loss       = 2;
     second_config.return_all_probs    = ReturnAllProbsMode::DEFAULT;
     auto first  = makeStream(101, {1, 2, 3}, first_config);
     auto second = makeStream(202, {4, 5}, second_config);
@@ -310,16 +309,30 @@ TEST_F(PPBatchStreamProcessorTest, OutputConfigCombinesFlagsAndKeepsPromptReques
     EXPECT_TRUE(output.return_all_hidden_states);
     EXPECT_TRUE(output.return_softmax_probs);
     EXPECT_TRUE(output.return_cum_log_probs);
-    EXPECT_TRUE(output.calculate_loss);
+    EXPECT_FALSE(output.calculate_loss);
     EXPECT_EQ(output.return_all_probs, ReturnAllProbsMode::DEFAULT);
-    ASSERT_EQ(output.prompt_logits_requests.size(), 2);
-    const auto& prompt = output.prompt_logits_requests[0];
+    ASSERT_EQ(output.requests.size(), 2);
+    EXPECT_TRUE(output.requests[0].return_logits);
+    EXPECT_TRUE(output.requests[0].return_hidden_states);
+    EXPECT_TRUE(output.requests[0].return_all_hidden_states);
+    EXPECT_FALSE(output.requests[0].return_softmax_probs);
+    EXPECT_FALSE(output.requests[0].return_cum_log_probs);
+    EXPECT_FALSE(output.requests[0].calculate_loss);
+    EXPECT_FALSE(output.requests[0].return_all_probs);
+    EXPECT_FALSE(output.requests[1].return_logits);
+    EXPECT_FALSE(output.requests[1].return_hidden_states);
+    EXPECT_FALSE(output.requests[1].return_all_hidden_states);
+    EXPECT_TRUE(output.requests[1].return_softmax_probs);
+    EXPECT_TRUE(output.requests[1].return_cum_log_probs);
+    EXPECT_FALSE(output.requests[1].calculate_loss);
+    EXPECT_TRUE(output.requests[1].return_all_probs);
+    const auto& prompt = output.requests[0].prompt_logits;
     EXPECT_TRUE(prompt.enabled);
     EXPECT_EQ(prompt.top_k, 2);
     EXPECT_EQ(prompt.start, 1);
     EXPECT_EQ(prompt.end, 3);
     EXPECT_FALSE(prompt.return_target_logprob);
-    EXPECT_FALSE(output.prompt_logits_requests[1].enabled);
+    EXPECT_FALSE(output.requests[1].prompt_logits.enabled);
     second->setReturnAllProbs(ReturnAllProbsMode::ORIGINAL);
     EXPECT_EQ(processor.gatherOutputConfig(groups).return_all_probs, ReturnAllProbsMode::ORIGINAL);
     second->setReturnAllProbs(ReturnAllProbsMode::NONE);
@@ -345,8 +358,13 @@ TEST_F(PPBatchStreamProcessorTest, SpeculativeOutputConfigDisablesPerStepOutputs
         EXPECT_EQ(output.return_all_probs, ReturnAllProbsMode::NONE);
         EXPECT_FALSE(output.return_softmax_probs);
         EXPECT_FALSE(output.calculate_loss);
-        ASSERT_EQ(output.prompt_logits_requests.size(), 1u);
-        EXPECT_FALSE(output.prompt_logits_requests[0].enabled);
+        ASSERT_EQ(output.requests.size(), 1u);
+        EXPECT_FALSE(output.requests[0].return_logits);
+        EXPECT_FALSE(output.requests[0].return_hidden_states);
+        EXPECT_FALSE(output.requests[0].return_all_hidden_states);
+        EXPECT_FALSE(output.requests[0].return_cum_log_probs);
+        EXPECT_FALSE(output.requests[0].return_all_probs);
+        EXPECT_FALSE(output.requests[0].prompt_logits.enabled);
     }
 }
 
@@ -1022,6 +1040,7 @@ TEST_F(PPBatchStreamProcessorTest, FillResultCommitsLastSampleAndCopiesRequested
     PPExecutionPlan plan;
     plan.sampling_plan = processor.gatherSamplingPlan(groups);
     plan.output_config = processor.gatherOutputConfig(groups);
+    plan.model_input.lm_output_indexes = intTensor({1, 3, 4});
 
     GptModelOutputs output;
     auto raw_logits = torch::zeros({3, 64});
@@ -1040,43 +1059,97 @@ TEST_F(PPBatchStreamProcessorTest, FillResultCommitsLastSampleAndCopiesRequested
     processor.fillExecutionResult(plan, output, sampled, result);
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids), (std::vector<int32_t>{7, 8, 9}));
     EXPECT_TRUE(result.new_token_ids.device().is_cpu());
-    EXPECT_TRUE(torch::equal(result.logits, raw_logits));
-    for (int row = 0; row < 3; ++row) {
-        EXPECT_NEAR(result.softmax_probs[row][0].item<float>(), (3.0f + row) / (66.0f + row), 1e-6);
+    ASSERT_EQ(result.request_outputs.size(), 2u);
+    const auto& requested = result.request_outputs[0];
+    EXPECT_TRUE(torch::equal(requested.logits, raw_logits.narrow(0, 0, 2)));
+    for (int row = 0; row < 2; ++row) {
+        EXPECT_NEAR(requested.softmax_probs[row][0].item<float>(), (3.0f + row) / (66.0f + row), 1e-6);
     }
-    EXPECT_EQ(tensorToVector<float>(result.cum_log_probs), (std::vector<float>{-1, -2, -3}));
-    EXPECT_TRUE(torch::equal(result.all_probs, sampled.all_probs.cpu()));
-    EXPECT_TRUE(torch::equal(result.hidden_states, output.hidden_states.cpu()));
-    EXPECT_TRUE(torch::equal(result.all_hidden_states, output.all_hidden_states.cpu()));
-    EXPECT_FALSE(result.loss.defined());
+    EXPECT_EQ(tensorToVector<float>(requested.cum_log_probs), (std::vector<float>{-1, -2}));
+    EXPECT_TRUE(torch::equal(requested.all_probs, sampled.all_probs.narrow(0, 0, 2).cpu()));
+    EXPECT_TRUE(torch::equal(requested.hidden_states, output.hidden_states.narrow(0, 0, 2).cpu()));
+    EXPECT_TRUE(torch::equal(requested.all_hidden_states, output.all_hidden_states.narrow(0, 0, 4).cpu()));
+    EXPECT_FALSE(requested.loss.defined());
+    const auto& unrequested = result.request_outputs[1];
+    EXPECT_FALSE(unrequested.logits.defined());
+    EXPECT_FALSE(unrequested.softmax_probs.defined());
+    EXPECT_FALSE(unrequested.cum_log_probs.defined());
+    EXPECT_FALSE(unrequested.all_probs.defined());
+    EXPECT_FALSE(unrequested.hidden_states.defined());
+    EXPECT_FALSE(unrequested.all_hidden_states.defined());
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_lengths), (std::vector<int32_t>{1, 1, 1}));
     ASSERT_EQ(result.request_errors.size(), 2);
     EXPECT_TRUE(result.request_errors[0].ok());
     EXPECT_TRUE(result.request_errors[1].ok());
 }
 
-TEST_F(PPBatchStreamProcessorTest, FillResultKeepsSpeculativeVerifyRowsForExplicitOutputPlan) {
+TEST_F(PPBatchStreamProcessorTest, MixedBatchReturnsOnlyRequestedRowsAtNonzeroOffsets) {
+    auto decode = makeStream(101, {1, 2});
+    commitTokens(decode, intTensor({7}).reshape({1, 1}));
+    auto cfg                     = config(2);
+    cfg.return_logits            = true;
+    cfg.return_hidden_states     = true;
+    cfg.return_all_hidden_states = true;
+    auto         multi           = makeStream(202, {3, 4, 5}, cfg);
+    auto         single          = makeStream(303, {6, 7});
+    StreamGroups groups({multi, single, decode});
+    auto         processor = makeProcessor();
+    TensorHolder holder;
+    auto         model_input = processor.gatherModelInput(groups, holder);
+    ASSERT_TRUE(model_input.ok());
+    PPExecutionPlan plan;
+    plan.model_input   = std::move(model_input.value());
+    plan.sampling_plan = processor.gatherSamplingPlan(groups);
+    plan.output_config = processor.gatherOutputConfig(groups);
+    ASSERT_EQ(tensorToVector<int64_t>(plan.sampling_plan.request_ids), (std::vector<int64_t>{101, 202, 303}));
+    ASSERT_EQ(tensorToVector<int32_t>(plan.model_input.lm_output_indexes), (std::vector<int32_t>{0, 3, 6, 8}));
+
+    GptModelOutputs model_output;
+    model_output.logits            = torch::arange(256, torch::kFloat32).reshape({4, 64}).cuda();
+    model_output.hidden_states     = torch::arange(16, torch::kFloat32).reshape({4, 4}).cuda();
+    model_output.all_hidden_states = torch::arange(36, torch::kFloat32).reshape({9, 4}).cuda();
+    SamplerOutput sampled;
+    sampled.token_ids = intTensor({10, 11, 12, 13}).reshape({4, 1}).cuda();
+    sampled.success   = torch::ones({4}, torch::TensorOptions(torch::kBool).device(torch::kCUDA));
+    auto result       = makeResult(plan.sampling_plan);
+    processor.fillExecutionResult(plan, model_output, sampled, result);
+
+    ASSERT_EQ(result.request_outputs.size(), 3u);
+    const auto& output = result.request_outputs[1];
+    EXPECT_TRUE(output.logits.is_cpu());
+    EXPECT_TRUE(torch::equal(output.logits, torch::arange(64, 192, torch::kFloat32).reshape({2, 64})));
+    EXPECT_TRUE(torch::equal(output.hidden_states, torch::arange(4, 12, torch::kFloat32).reshape({2, 4})));
+    EXPECT_TRUE(torch::equal(output.all_hidden_states, torch::arange(4, 28, torch::kFloat32).reshape({6, 4})));
+    for (auto index : {0, 2}) {
+        const auto& empty = result.request_outputs[index];
+        EXPECT_FALSE(empty.logits.defined());
+        EXPECT_FALSE(empty.hidden_states.defined());
+        EXPECT_FALSE(empty.all_hidden_states.defined());
+    }
+    EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids), (std::vector<int32_t>{10, 11, 12, 13}));
+    ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+    EXPECT_EQ(multi->completeTokenIdsVec(0), (std::vector<int>{3, 4, 5, 11}));
+    EXPECT_EQ(multi->completeTokenIdsVec(1), (std::vector<int>{3, 4, 5, 12}));
+    for (const auto& stream : {decode, single}) {
+        auto received = stream->nextOutput(1);
+        ASSERT_TRUE(received.ok());
+        const auto& value = received.value().generate_outputs.at(0);
+        EXPECT_FALSE(value.logits.has_value());
+        EXPECT_FALSE(value.hidden_states.has_value());
+        EXPECT_FALSE(value.all_hidden_states.has_value());
+    }
+}
+
+TEST_F(PPBatchStreamProcessorTest, VerifyResultReturnsAcceptedTokensAndErrorsWithoutOptionalOutputs) {
     auto first  = makeStream(101, {1, 2});
     auto second = makeStream(202, {3});
     auto third  = makeStream(303, {4});
     StreamGroups groups({first, second, third});
-    auto processor = makeProcessor(SP_TYPE_MTP);
+    auto            processor = makeProcessor(SP_TYPE_MTP, RoleType::PDFUSION, 2);
     PPExecutionPlan plan;
     plan.is_decode     = true;
     plan.sampling_plan = processor.gatherSamplingPlan(groups);
     plan.output_config = processor.gatherOutputConfig(groups);
-    /** Enable both flags to check probability row indexing and verify that prompt loss stays empty. */
-    plan.output_config.return_softmax_probs = true;
-    plan.output_config.calculate_loss = true;
-    plan.model_input.need_all_logits = true;
-
-    /** K = 2: three logits rows per stream. */
-    GptModelOutputs output;
-    auto raw_logits = torch::zeros({9, 64});
-    for (int row = 0; row < 9; ++row) {
-        raw_logits[row][10 + row] = std::log(3.0f + row);
-    }
-    output.logits = raw_logits.to(torch::kCUDA);
     SamplerOutput target_sampled;
     target_sampled.success =
         torch::tensor({true, true, true, false, true, true, true, false, true}, torch::kBool).to(torch::kCUDA);
@@ -1088,19 +1161,19 @@ TEST_F(PPBatchStreamProcessorTest, FillResultKeepsSpeculativeVerifyRowsForExplic
     sp_output.processor_errors = {
         std::nullopt, ErrorInfo(ErrorCode::INVALID_PARAMS, "verify failed"), std::nullopt};
     auto result = makeResult(plan.sampling_plan);
-    processor.fillExecutionResult(plan, output, target_sampled, sp_output, result);
+    processor.fillExecutionResult(plan, GptModelOutputs{}, target_sampled, sp_output, result);
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids), (std::vector<int32_t>{10, 11, 12, 13, 0, 0, 16, 17, 0}));
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_lengths), (std::vector<int32_t>{3, 1, 2}));
-    ASSERT_EQ(result.softmax_probs.dim(), 2);
-    ASSERT_EQ(result.softmax_probs.size(0), 3);
-    ASSERT_EQ(result.softmax_probs.size(1), 3);
-    for (int col = 0; col < 3; ++col) {
-        EXPECT_NEAR(result.softmax_probs[0][col].item<float>(), (3.0f + col) / (66.0f + col), 1e-6);
+    for (const auto& output : result.request_outputs) {
+        EXPECT_FALSE(output.logits.defined());
+        EXPECT_FALSE(output.softmax_probs.defined());
+        EXPECT_FALSE(output.cum_log_probs.defined());
+        EXPECT_FALSE(output.all_probs.defined());
+        EXPECT_FALSE(output.hidden_states.defined());
+        EXPECT_FALSE(output.all_hidden_states.defined());
+        EXPECT_FALSE(output.loss.defined());
+        EXPECT_FALSE(output.prompt_logits.has_value());
     }
-    EXPECT_NEAR(result.softmax_probs[1][0].item<float>(), 6.0f / 69.0f, 1e-6);
-    EXPECT_NEAR(result.softmax_probs[2][1].item<float>(), 10.0f / 73.0f, 1e-6);
-    EXPECT_FALSE(result.cum_log_probs.defined());
-    EXPECT_FALSE(result.loss.defined());
     /** Processor errors take precedence over sampler failures. */
     EXPECT_TRUE(result.request_errors[0].ok());
     EXPECT_EQ(result.request_errors[1].code(), ErrorCode::INVALID_PARAMS);
@@ -1115,6 +1188,7 @@ TEST_F(PPBatchStreamProcessorTest, FillResultPreservesEarlierErrorsAndMapsSample
     auto processor = makeProcessor();
     PPExecutionPlan plan;
     plan.sampling_plan = processor.gatherSamplingPlan(StreamGroups({first, multi, failed, healthy}));
+    plan.output_config     = processor.gatherOutputConfig(StreamGroups({first, multi, failed, healthy}));
     auto result = makeResult(plan.sampling_plan);
     const ErrorInfo initialization_error(ErrorCode::INVALID_PARAMS, "tail grammar backend unavailable");
     const ErrorInfo processor_error(ErrorCode::EXECUTION_EXCEPTION, "logits processor failed");
@@ -1130,12 +1204,14 @@ TEST_F(PPBatchStreamProcessorTest, FillResultPreservesEarlierErrorsAndMapsSample
     EXPECT_EQ(result.request_errors[2].ToString(), processor_error.ToString());
     EXPECT_TRUE(result.request_errors[3].ok());
     EXPECT_EQ(result.new_token_ids.size(0), 5);
-    EXPECT_FALSE(result.logits.defined());
-    EXPECT_FALSE(result.softmax_probs.defined());
-    EXPECT_FALSE(result.cum_log_probs.defined());
-    EXPECT_FALSE(result.all_probs.defined());
-    EXPECT_FALSE(result.hidden_states.defined());
-    EXPECT_FALSE(result.all_hidden_states.defined());
+    for (const auto& output : result.request_outputs) {
+        EXPECT_FALSE(output.logits.defined());
+        EXPECT_FALSE(output.softmax_probs.defined());
+        EXPECT_FALSE(output.cum_log_probs.defined());
+        EXPECT_FALSE(output.all_probs.defined());
+        EXPECT_FALSE(output.hidden_states.defined());
+        EXPECT_FALSE(output.all_hidden_states.defined());
+    }
 }
 
 TEST_F(PPBatchStreamProcessorTest, FillResultUsesCompactProbabilityBeforeRestoringTokenIds) {
@@ -1160,13 +1236,12 @@ TEST_F(PPBatchStreamProcessorTest, FillResultUsesCompactProbabilityBeforeRestori
     EXPECT_EQ(result.request_errors[0].code(), ErrorCode::UNKNOWN_ERROR);
     EXPECT_TRUE(result.request_errors[1].ok());
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids), (std::vector<int32_t>{0, 7}));
-    EXPECT_NEAR(result.softmax_probs[1][0].item<float>(), 0.5f, 1e-6);
+    EXPECT_NEAR(result.request_outputs[1].softmax_probs[0][0].item<float>(), 0.5f, 1e-6);
 }
 
-TEST_F(PPBatchStreamProcessorTest, FillResultPromptScoresUseFirstSequenceOnlyInPrefill) {
+TEST_F(PPBatchStreamProcessorTest, FillResultPromptLogitsAreRequestLocalAndUseFirstSequenceOnlyInPrefill) {
     setVocab(4);
     auto cfg = config(2);
-    cfg.calculate_loss        = 2;
     cfg.return_prompt_logits  = true;
     cfg.prompt_logits_top_k   = 2;
     cfg.prompt_logits_start   = 1;
@@ -1176,8 +1251,9 @@ TEST_F(PPBatchStreamProcessorTest, FillResultPromptScoresUseFirstSequenceOnlyInP
     short_config.return_prompt_logits = true;
     short_config.prompt_logits_top_k  = 2;
     auto single = makeStream(303, {1}, short_config);
+    auto         unrequested          = makeStream(404, {2});
     auto processor = makeProcessor();
-    StreamGroups groups({multi, single});
+    StreamGroups groups({multi, single, unrequested});
     TensorHolder holder;
     auto gathered = processor.gatherModelInput(groups, holder);
     ASSERT_TRUE(gathered.ok());
@@ -1185,24 +1261,25 @@ TEST_F(PPBatchStreamProcessorTest, FillResultPromptScoresUseFirstSequenceOnlyInP
     plan.model_input   = std::move(gathered.value());
     plan.sampling_plan = processor.gatherSamplingPlan(groups);
     plan.output_config = processor.gatherOutputConfig(groups);
-    ASSERT_EQ(tensorToVector<int32_t>(plan.model_input.lm_output_indexes), (std::vector<int32_t>{2, 5, 6}));
+    ASSERT_EQ(tensorToVector<int32_t>(plan.model_input.lm_output_indexes), (std::vector<int32_t>{2, 5, 6, 7}));
     GptModelOutputs output;
-    output.all_logits = torch::zeros({7, 4});
+    output.all_logits = torch::zeros({8, 4});
     output.all_logits[0].copy_(torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}).log());
     output.all_logits[1].copy_(torch::tensor({4.0f, 3.0f, 2.0f, 1.0f}).log());
     output.all_logits[2].copy_(torch::tensor({1.0f, 3.0f, 2.0f, 4.0f}).log());
     output.all_logits[6].copy_(torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}).log());
     SamplerOutput sampled;
-    sampled.token_ids = intTensor({2, 2, 0}).reshape({3, 1});
-    sampled.success  = torch::ones({3}, torch::kBool);
+    sampled.token_ids = intTensor({2, 2, 0, 0}).reshape({4, 1});
+    sampled.success   = torch::ones({4}, torch::kBool);
     auto result = makeResult(plan.sampling_plan);
     processor.fillExecutionResult(plan, output, sampled, result);
-    ASSERT_EQ(result.loss.numel(), 2);
-    EXPECT_NEAR(result.loss[0].item<float>(), std::log(5.0), 1e-6);
-    EXPECT_NEAR(result.loss[1].item<float>(), std::log(5.0), 1e-6);
-    ASSERT_EQ(result.prompt_logits.size(), 2);
-    ASSERT_TRUE(result.prompt_logits[0].has_value());
-    const auto& prompt = result.prompt_logits[0].value();
+    ASSERT_EQ(result.request_outputs.size(), 3u);
+    for (const auto& request : result.request_outputs) {
+        EXPECT_FALSE(request.loss.defined());
+    }
+    EXPECT_FALSE(result.request_outputs[2].prompt_logits.has_value());
+    ASSERT_TRUE(result.request_outputs[0].prompt_logits.has_value());
+    const auto& prompt = result.request_outputs[0].prompt_logits.value();
     EXPECT_EQ(prompt.start_pos, 1);
     EXPECT_EQ(prompt.end_pos, 3);
     EXPECT_EQ(tensorToVector<int32_t>(prompt.topk_token_ids), (std::vector<int32_t>{0, 1, 3, 1}));
@@ -1213,17 +1290,17 @@ TEST_F(PPBatchStreamProcessorTest, FillResultPromptScoresUseFirstSequenceOnlyInP
     }
     ASSERT_EQ(prompt.target_logprobs.numel(), 1);
     EXPECT_NEAR(prompt.target_logprobs[0].item<float>(), std::log(0.2), 1e-6);
-    ASSERT_TRUE(result.prompt_logits[1].has_value());
-    EXPECT_EQ(result.prompt_logits[1]->topk_logprobs.size(0), 1);
-    EXPECT_FALSE(result.prompt_logits[1]->target_logprobs.defined());
+    ASSERT_TRUE(result.request_outputs[1].prompt_logits.has_value());
+    EXPECT_EQ(result.request_outputs[1].prompt_logits->topk_logprobs.size(0), 1);
+    EXPECT_FALSE(result.request_outputs[1].prompt_logits->target_logprobs.defined());
 
-    /** Decode produces no prompt outputs. */
     plan.is_decode     = true;
     auto decode_result = makeResult(plan.sampling_plan);
     processor.fillExecutionResult(plan, output, sampled, decode_result);
-    EXPECT_FALSE(decode_result.loss.defined());
-    EXPECT_FALSE(decode_result.prompt_logits[0].has_value());
-    EXPECT_FALSE(decode_result.prompt_logits[1].has_value());
+    for (const auto& request : decode_result.request_outputs) {
+        EXPECT_FALSE(request.prompt_logits.has_value());
+        EXPECT_FALSE(request.loss.defined());
+    }
 }
 
 /** 6. Dispatch: commit each request's slice, isolate errors, and retire every returned inflight row. */
@@ -1326,7 +1403,7 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchPreservesProcessorStateAfterLoc
     EXPECT_TRUE(final_output.finished);
 }
 
-TEST_F(PPBatchStreamProcessorTest, NormalDispatchSlicesMixedPhasesAndMultiSequenceOutputs) {
+TEST_F(PPBatchStreamProcessorTest, NormalDispatchUsesRequestOutputsAcrossMixedPhasesAndSequences) {
     auto decode = makeStream(101, {1, 2});
     commitTokens(decode, intTensor({9}).reshape({1, 1}));
     auto cfg = config(2);
@@ -1336,7 +1413,6 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchSlicesMixedPhasesAndMultiSequen
     cfg.return_all_probs         = ReturnAllProbsMode::DEFAULT;
     cfg.return_hidden_states     = true;
     cfg.return_all_hidden_states = true;
-    cfg.calculate_loss           = 2;
     cfg.return_prompt_logits     = true;
     auto multi = makeStream(202, {3, 4, 5}, cfg);
     auto single_config = config();
@@ -1350,17 +1426,18 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchSlicesMixedPhasesAndMultiSequen
     auto result = makeResult(std::vector<int64_t>{101, 202, 303});
     result.new_token_ids     = intTensor({10, 11, 12, 13}).reshape({4, 1});
     result.new_token_lengths = torch::ones({4}, torch::kInt32);
-    result.logits            = torch::arange(4 * 64, torch::kFloat32).reshape({4, 64});
-    result.hidden_states     = torch::arange(100, 116, torch::kFloat32).reshape({4, 4});
-    result.all_hidden_states = torch::arange(200, 236, torch::kFloat32).reshape({9, 4});
-    result.softmax_probs     = torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}).reshape({4, 1});
-    result.cum_log_probs     = torch::tensor({-1.0f, -2.0f, -3.0f, -4.0f});
-    result.all_probs         = torch::zeros({4, 64});
-    for (int row = 0; row < 4; ++row) {
-        result.all_probs[row][10 + row] = 1;
+    auto& multi_result             = result.request_outputs[1];
+    multi_result.logits            = torch::arange(64, 192, torch::kFloat32).reshape({2, 64});
+    multi_result.hidden_states     = torch::arange(104, 112, torch::kFloat32).reshape({2, 4});
+    multi_result.all_hidden_states = torch::arange(204, 228, torch::kFloat32).reshape({6, 4});
+    multi_result.softmax_probs     = torch::tensor({0.2f, 0.3f}).reshape({2, 1});
+    multi_result.cum_log_probs     = torch::tensor({-2.0f, -3.0f});
+    multi_result.all_probs         = torch::zeros({2, 64});
+    for (int row = 0; row < 2; ++row) {
+        multi_result.all_probs[row][11 + row] = 1;
     }
-    result.loss = torch::tensor({0.25f, 0.5f, 0.75f});
-    result.prompt_logits[1] = PromptLogitsOutput{
+    result.request_outputs[2].hidden_states = torch::arange(112, 116, torch::kFloat32).reshape({1, 4});
+    result.request_outputs[1].prompt_logits = PromptLogitsOutput{
         torch::tensor({-0.5f}).reshape({1, 1}), intTensor({4}).reshape({1, 1}), torch::tensor({-0.5f}), 0, 1};
     for (const auto& stream : groups.allStreams()) {
         stream->setPPInflight();
@@ -1381,27 +1458,27 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchSlicesMixedPhasesAndMultiSequen
         SCOPED_TRACE(sequence);
         const auto& output = multi_output.value().generate_outputs[sequence];
         ASSERT_TRUE(output.logits.has_value());
-        EXPECT_TRUE(torch::equal(output.logits.value(), result.logits.narrow(0, 1 + sequence, 1)));
+        EXPECT_TRUE(torch::equal(output.logits.value(), multi_result.logits.narrow(0, sequence, 1)));
         ASSERT_TRUE(output.hidden_states.has_value());
-        EXPECT_TRUE(torch::equal(output.hidden_states.value(), result.hidden_states.narrow(0, 1 + sequence, 1)));
+        EXPECT_TRUE(torch::equal(output.hidden_states.value(), multi_result.hidden_states.narrow(0, sequence, 1)));
         ASSERT_TRUE(output.all_hidden_states.has_value());
-        EXPECT_TRUE(torch::equal(output.all_hidden_states.value(), result.all_hidden_states.narrow(0, 1, 6)));
-        ASSERT_TRUE(output.loss.has_value());
-        EXPECT_EQ(tensorToVector<float>(output.loss.value()), (std::vector<float>{0.25f, 0.5f}));
+        EXPECT_TRUE(torch::equal(output.all_hidden_states.value(), multi_result.all_hidden_states));
+        EXPECT_FALSE(output.loss.has_value());
         ASSERT_TRUE(output.prompt_logits.has_value());
-        EXPECT_TRUE(torch::equal(output.prompt_logits->topk_token_ids, result.prompt_logits[1]->topk_token_ids));
+        EXPECT_TRUE(torch::equal(output.prompt_logits->topk_token_ids,
+                                 result.request_outputs[1].prompt_logits->topk_token_ids));
         ASSERT_TRUE(output.aux_info.softmax_probs.has_value());
         EXPECT_NEAR(output.aux_info.softmax_probs->item<float>(), sequence == 0 ? 0.2f : 0.3f, 1e-6);
         ASSERT_TRUE(output.aux_info.cum_log_probs.has_value());
         EXPECT_FLOAT_EQ(output.aux_info.cum_log_probs->item<float>(), -2.0f - sequence);
         ASSERT_TRUE(output.aux_info.all_probs.has_value());
-        EXPECT_TRUE(torch::equal(output.aux_info.all_probs.value(), result.all_probs.narrow(0, 1 + sequence, 1)));
+        EXPECT_TRUE(torch::equal(output.aux_info.all_probs.value(), multi_result.all_probs.narrow(0, sequence, 1)));
     }
     auto single_output = single->nextOutput(1);
     ASSERT_TRUE(single_output.ok());
     const auto& single_value = single_output.value().generate_outputs.at(0);
     ASSERT_TRUE(single_value.hidden_states.has_value());
-    EXPECT_TRUE(torch::equal(single_value.hidden_states.value(), result.hidden_states.narrow(0, 3, 1)));
+    EXPECT_TRUE(torch::equal(single_value.hidden_states.value(), result.request_outputs[2].hidden_states));
     EXPECT_FALSE(single_value.prompt_logits.has_value());
     EXPECT_FALSE(single_value.all_hidden_states.has_value());
     auto decode_output = decode->nextOutput(1);
@@ -1451,7 +1528,6 @@ TEST_F(PPBatchStreamProcessorTest, PrefillDispatchPreservesEachRequestsDraftHand
     result.propose_all_probs[0][0][10] = 1;
     result.propose_all_probs[1][0][11] = 1;
     result.propose_hidden_states = torch::arange(12, torch::kFloat32).reshape({2, 6}).to(torch::kBFloat16);
-    result.hidden_states = torch::full({2, 6}, -100.0f);
     auto processor                     = makeProcessor(SP_TYPE_MTP, RoleType::PREFILL);
     ASSERT_TRUE(processor.dispatchSpeculativeExecutionResult(groups, result).ok());
     int row = 0;
@@ -1749,7 +1825,7 @@ TEST_F(PPBatchStreamProcessorTest, MtpDispatchCommitsAcceptedLinearState) {
         result.new_token_ids     = torch::arange(10, 11 + c.draft_count, torch::kInt32).reshape({1, c.draft_count + 1});
         result.new_token_lengths = intTensor({c.num_new_tokens});
         result.propose_token_ids = torch::arange(20, 20 + c.draft_count, torch::kInt32).reshape({1, c.draft_count});
-        result.prompt_logits.resize(1);
+        result.request_outputs.resize(1);
         result.request_errors.resize(1);
         ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
         EXPECT_FALSE(stream->hasError());

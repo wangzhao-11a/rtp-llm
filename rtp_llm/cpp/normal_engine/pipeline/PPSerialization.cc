@@ -9,8 +9,8 @@ namespace rtp_llm::pp_serialization {
 
 namespace {
 
-/** Bump when any payload layout changes; all PP peers must use the same version. */
-constexpr uint32_t kVersion = 23;
+/** Payload fields have a fixed positional layout, so PP peers must use the same wire version. */
+constexpr uint32_t kVersion = 24;
 
 struct ByteWriter {
     std::vector<uint8_t> buf;
@@ -307,6 +307,18 @@ void promptLogitsRequestFields(IO& io, Request& request) {
 }
 
 template<typename IO, typename Config>
+void requestOutputConfigFields(IO& io, Config& config) {
+    io.flag(config.return_logits);
+    io.flag(config.return_softmax_probs);
+    io.flag(config.return_cum_log_probs);
+    io.flag(config.calculate_loss);
+    io.flag(config.return_hidden_states);
+    io.flag(config.return_all_hidden_states);
+    io.flag(config.return_all_probs);
+    promptLogitsRequestFields(io, config.prompt_logits);
+}
+
+template<typename IO, typename Config>
 void outputConfigFields(IO& io, Config& output_config) {
     io.flag(output_config.return_logits);
     io.flag(output_config.return_softmax_probs);
@@ -315,8 +327,7 @@ void outputConfigFields(IO& io, Config& output_config) {
     io.flag(output_config.return_hidden_states);
     io.flag(output_config.return_all_hidden_states);
     io.template scalar<int32_t>(output_config.return_all_probs);
-    io.sequence(output_config.prompt_logits_requests,
-                [](auto& io, auto& request) { promptLogitsRequestFields(io, request); });
+    io.sequence(output_config.requests, [](auto& io, auto& request) { requestOutputConfigFields(io, request); });
 }
 
 template<typename IO, typename Output>
@@ -328,6 +339,19 @@ void promptLogitsOutputFields(IO& io, Output& output) {
     io.template scalar<int32_t>(output.end_pos);
 }
 
+template<typename IO, typename Output>
+void requestOutputFields(IO& io, Output& output) {
+    io.tensor(output.hidden_states);
+    io.tensor(output.logits);
+    io.tensor(output.softmax_probs);
+    io.tensor(output.cum_log_probs);
+    io.tensor(output.all_probs);
+    io.tensor(output.loss);
+    io.tensor(output.all_hidden_states);
+    io.optional(output.prompt_logits,
+                [](auto& io, auto& prompt_logits) { promptLogitsOutputFields(io, prompt_logits); });
+}
+
 template<typename IO, typename Result>
 void executionResultFields(IO& io, Result& result) {
     io.template scalar<int64_t>(result.sample_input_us);
@@ -337,16 +361,7 @@ void executionResultFields(IO& io, Result& result) {
     io.tensor(result.propose_token_ids);
     io.tensor(result.propose_all_probs);
     io.tensor(result.propose_hidden_states);
-    io.tensor(result.hidden_states);
-    io.tensor(result.logits);
-    io.tensor(result.softmax_probs);
-    io.tensor(result.cum_log_probs);
-    io.tensor(result.all_probs);
-    io.tensor(result.loss);
-    io.tensor(result.all_hidden_states);
-    io.sequence(result.prompt_logits, [](auto& io, auto& prompt_logits) {
-        io.optional(prompt_logits, [](auto& io, auto& output) { promptLogitsOutputFields(io, output); });
-    });
+    io.sequence(result.request_outputs, [](auto& io, auto& output) { requestOutputFields(io, output); });
     io.errors(result.request_errors);
 }
 

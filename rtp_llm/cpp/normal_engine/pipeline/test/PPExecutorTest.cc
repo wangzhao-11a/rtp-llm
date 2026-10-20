@@ -533,7 +533,7 @@ protected:
         const auto        stream_count = plan.request_ids.size(0);
         result.request_ids             = plan.request_ids.to(torch::kCPU).contiguous();
         result.request_errors.assign(stream_count, ErrorInfo::OkStatus());
-        result.prompt_logits.resize(stream_count);
+        result.request_outputs.resize(stream_count);
         return result;
     }
 
@@ -795,7 +795,7 @@ protected:
         result.new_token_ids     = intTensor({token}).reshape({1, 1});
         result.new_token_lengths = intTensor({1});
         result.request_errors.resize(1);
-        result.prompt_logits.resize(1);
+        result.request_outputs.resize(1);
         return result;
     }
 
@@ -1822,8 +1822,8 @@ TEST_F(PPExecutorTest, FirstAdmissionAllowsOptionalOutputsOnlyWithoutSpeculation
                 EXPECT_FALSE(plan.model_input.skip_run);
                 EXPECT_EQ(recorded->inputs.size(), 1u);
                 EXPECT_EQ(plan.output_config.return_softmax_probs, !prompt_logits);
-                ASSERT_EQ(plan.output_config.prompt_logits_requests.size(), 1u);
-                EXPECT_EQ(plan.output_config.prompt_logits_requests[0].enabled, prompt_logits);
+                ASSERT_EQ(plan.output_config.requests.size(), 1u);
+                EXPECT_EQ(plan.output_config.requests[0].prompt_logits.enabled, prompt_logits);
             } else {
                 EXPECT_EQ(stream->statusInfo().code(), ErrorCode::INVALID_PARAMS);
                 EXPECT_NE(stream->statusInfo().ToString().find(
@@ -1961,7 +1961,7 @@ TEST_F(PPExecutorTest, FirstPrefillOnlySkipsSamplingCompatibilityAndDrainsItsRes
         result.new_token_ids = torch::zeros({1, 1}, torch::kInt32);
         result.new_token_lengths = intTensor({1});
         result.request_errors.resize(1);
-        result.prompt_logits.resize(1);
+        result.request_outputs.resize(1);
         wire->enqueueObject(pp_serialization::serializeExecutionResult(result));
 
         ASSERT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
@@ -2387,7 +2387,7 @@ TEST_F(PPExecutorTest, FirstReturnedAcceptanceSurvivesBudgetClippingAndCancellat
     result.new_token_lengths = intTensor({2, 4, 1, 3});
     result.new_token_ids[2].zero_();
     result.propose_token_ids = intTensor({20, 21, 22}).repeat({4, 1});
-    result.prompt_logits.resize(4);
+    result.request_outputs.resize(4);
     result.request_errors.resize(4);
     result.request_errors[2] = ErrorInfo(ErrorCode::UNKNOWN_ERROR, "failed placeholder");
     auto transport = std::make_unique<InMemoryPPTransport>();
@@ -2666,7 +2666,7 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     decode_result.new_token_lengths = intTensor({4});
     decode_result.propose_token_ids = intTensor({20, 21, 22}).reshape({1, 3});
     decode_result.request_errors.resize(1);
-    decode_result.prompt_logits.resize(1);
+    decode_result.request_outputs.resize(1);
     auto prefill_result              = decode_result;
     prefill_result.request_ids       = torch::tensor({202}, torch::kInt64);
     prefill_result.new_token_ids     = intTensor({14}).reshape({1, 1});
@@ -2879,6 +2879,9 @@ TEST_F(PPExecutorTest, LastSamplesAcrossRoundsWithoutReinitializingRequestState)
     prefill.sampling_plan.do_sample.fill_(true);
     prefill.sampling_plan.top_k.fill_(2);
     prefill.output_config.return_all_hidden_states = true;
+    for (auto& request : prefill.output_config.requests) {
+        request.return_all_hidden_states = true;
+    }
     prefill.model_input.need_all_hidden_states = true;
     enqueuePlan(*wire, prefill);
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
@@ -2886,7 +2889,10 @@ TEST_F(PPExecutorTest, LastSamplesAcrossRoundsWithoutReinitializingRequestState)
     auto first = lastResult(*wire);
     EXPECT_GT(first.sample_input_us, 0);
     EXPECT_EQ(tensorToVector<int32_t>(first.new_token_ids), (std::vector<int32_t>{7, 8}));
-    EXPECT_TRUE(torch::equal(first.all_hidden_states, recorded->hidden_buffer.narrow(1, 0, 2).cpu()));
+    EXPECT_TRUE(torch::equal(first.request_outputs[0].all_hidden_states,
+                             recorded->hidden_buffer.narrow(0, 0, 2).narrow(1, 0, 2).cpu()));
+    EXPECT_TRUE(torch::equal(first.request_outputs[1].all_hidden_states,
+                             recorded->hidden_buffer.narrow(0, 2, 3).narrow(1, 0, 2).cpu()));
     EXPECT_TRUE(recorded->hidden_requests.empty());
     EXPECT_EQ(tensorToVector<int32_t>(first.new_token_lengths), (std::vector<int32_t>{1, 1}));
     EXPECT_FALSE(first.propose_token_ids.defined());
@@ -2961,16 +2967,20 @@ TEST_F(PPExecutorTest, LastUpdatesStatesAtRequestSequenceOffsetsAndPreservesEarl
     auto failed = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 2);
     auto healthy = makeStream(ResourceContext{}, params.model_config_, 202, {3, 4}, 2);
     auto update_failed = makeStream(ResourceContext{}, params.model_config_, 303, {5, 6}, 1);
-    const auto plan =
-        executor.batch_stream_processor_->gatherSamplingPlan(StreamGroups({failed, healthy, update_failed}));
+    auto       unrequested   = makeStream(ResourceContext{}, params.model_config_, 404, {7, 8}, 1);
+    const auto plan          = executor.batch_stream_processor_->gatherSamplingPlan(
+        StreamGroups({failed, healthy, update_failed, unrequested}));
     auto first = recordState(executor, 101, 2);
     auto second = recordState(executor, 202, 2);
     auto third = recordState(executor, 303);
+    auto fourth                             = recordState(executor, 404);
     third->update_error = ErrorInfo(ErrorCode::UNKNOWN_ERROR, "state update failed");
     auto result = makeInitializedResult(plan);
-    result.new_token_ids     = intTensor({0, 0, 20, 21, 30}).reshape({5, 1});
-    result.new_token_lengths = torch::ones({5}, torch::kInt32);
-    result.cum_log_probs     = torch::full({5}, -3.0, torch::kFloat32);
+    result.new_token_ids                    = intTensor({0, 0, 20, 21, 30, 40}).reshape({6, 1});
+    result.new_token_lengths                = torch::ones({6}, torch::kInt32);
+    result.request_outputs[0].cum_log_probs = torch::full({2}, -3.0, torch::kFloat32);
+    result.request_outputs[1].cum_log_probs = torch::full({2}, -3.0, torch::kFloat32);
+    result.request_outputs[2].cum_log_probs = torch::full({1}, -3.0, torch::kFloat32);
     result.request_errors[0] = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "sampling failed");
     executor.advanceSamplingStates(plan, result);
     EXPECT_TRUE(first->committed_tokens.empty());
@@ -2984,6 +2994,11 @@ TEST_F(PPExecutorTest, LastUpdatesStatesAtRequestSequenceOffsetsAndPreservesEarl
     EXPECT_EQ(tensorToVector<float>(executor.sampling_states_.at(101).cum_log_probs), (std::vector<float>{0, 0}));
     EXPECT_EQ(tensorToVector<float>(executor.sampling_states_.at(202).cum_log_probs), (std::vector<float>{-3, -3}));
     EXPECT_EQ(executor.sampling_states_.at(303).cum_log_probs.item<float>(), 0);
+    ASSERT_EQ(fourth->committed_tokens.size(), 1u);
+    EXPECT_EQ(tensorToVector<int32_t>(fourth->committed_tokens[0]), std::vector<int32_t>{40});
+    EXPECT_TRUE(result.request_errors[3].ok());
+    EXPECT_FALSE(result.request_outputs[3].cum_log_probs.defined());
+    EXPECT_EQ(executor.sampling_states_.at(404).cum_log_probs.item<float>(), 0);
 }
 
 TEST_F(PPExecutorTest, LastCleansFinishedRequestsBeforeEmptyOrActiveExecution) {
