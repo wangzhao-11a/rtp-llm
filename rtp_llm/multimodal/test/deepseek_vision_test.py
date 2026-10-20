@@ -26,7 +26,7 @@ class DeepSeekVisionTest(TestCase):
         if not model:
             raise unittest.SkipTest(
                 "DSV41_MODEL_PATH not set; real-weight tests run where the "
-                "checkpoint is available (GB200 lanes / local runs)"
+                "checkpoint is available (SM100_ARM lanes / local runs)"
             )
         model_path = Path(model)
         reference_path = model_path / "inference/vision.py"

@@ -6,7 +6,7 @@ def cuda13_sm100_py_test(name, srcs, main = None, gpu_count = 1, tags = [], env 
     test_env = dict(env)
     test_env["GPU_COUNT"] = str(gpu_count)
     # x86 tests run on the SM103 pool (SM 10.3); SM100_ARM_CU13 is the
-    # separate CUDA13 GB200 pool.
+    # separate CUDA13 SM100_ARM pool.
     for suffix, config, gpu in [
         ("", "@//:using_cuda13_arm", "SM100_ARM_CU13"),
         ("_x86", "@//:using_cuda13_x86", cuda13_x86_test_gpu()),

@@ -186,7 +186,7 @@ def v4_indexer_score(
     if S == 0 or T == 0:
         return out
 
-    # Tile sizes tuned on SM100 (GB200) for V4-Flash 64k+CP=4 (S=T=16384,
+    # Tile sizes tuned on SM100_ARM for V4-Flash 64k+CP=4 (S=T=16384,
     # H=64, D=128).  Best config across the 4-of-4 shape sweep was
     # BLOCK_S=16 / BLOCK_T=256 / num_warps=4 / num_stages=2, with the
     # BF16 tensor-core mma path enabled in the kernel above.  Smaller

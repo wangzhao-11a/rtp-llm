@@ -414,7 +414,7 @@ class V41VisionEmbeddingTest(TestCase):
         if not model:
             raise unittest.SkipTest(
                 "DSV41_MODEL_PATH not set; real-weight vision tests run where "
-                "the V4.1 checkpoint is available (GB200 lanes / local runs)"
+                "the V4.1 checkpoint is available (SM100_ARM lanes / local runs)"
             )
         model = Path(model)
         source = model / "inference/vision.py"

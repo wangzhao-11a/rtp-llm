@@ -70,7 +70,7 @@ class V41ProcessorTest(TestCase):
         if not model:
             raise unittest.SkipTest(
                 "DSV41_MODEL_PATH not set; real-weight tests run where the "
-                "checkpoint is available (GB200 lanes / local runs)"
+                "checkpoint is available (SM100_ARM lanes / local runs)"
             )
         model = Path(model)
         cls.reference = load_reference(

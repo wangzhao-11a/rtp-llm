@@ -1,7 +1,7 @@
 {
     "_comment": [
         "Refreshed from the smoke_actual artifact of run 65789165, case",
-        "moe_nvfp4_online_deepep_ll_tp2_sm100. This is not a run-to-run flake: smoke-gb200 had",
+        "moe_nvfp4_online_deepep_ll_tp2_sm100. This is not a run-to-run flake: the SM100_ARM smoke lane had",
         "been running with --config=rewrite_smoke, which sets SAVE_RESPONSE and makes",
         "utils.no_compare() skip every golden assertion, so this file was being regenerated",
         "instead of compared and had silently drifted from the real output. The rewrite flag is",

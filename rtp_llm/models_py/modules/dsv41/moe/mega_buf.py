@@ -6,7 +6,7 @@ NVLink dispatch + combine. The buffer holds only single-layer staging
 no longer needed once the next layer's MoE starts. So we share **one buffer**
 across all MoE layers via a module-level cache; otherwise V4-Flash's 64+ MoE
 layers each allocate ~3.4 GiB at CP=4 → ~218 GiB symm memory per rank,
-OOMing the GB200's 188 GiB after dozens of allocs.
+OOMing the SM100_ARM node's 188 GiB after dozens of allocs.
 """
 
 import logging

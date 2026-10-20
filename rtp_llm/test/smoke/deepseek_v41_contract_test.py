@@ -1,4 +1,4 @@
-"""GB200 V4.1 generation, Engram, graph replay and actual prefix-cache reuse.
+"""SM100_ARM V4.1 generation, Engram, graph replay and actual prefix-cache reuse.
 
 Uses the shared smoke server lifecycle. Outputs are compared to an uncached
 request from this run, so no unverified golden text or model weights are stored.

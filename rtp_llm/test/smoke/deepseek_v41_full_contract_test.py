@@ -1,4 +1,4 @@
-"""GB200 CP2/DP2 P/D smoke with CED, DSpark, Engram and verify graph reuse."""
+"""SM100_ARM CP2/DP2 P/D smoke with CED, DSpark, Engram and verify graph reuse."""
 
 import json
 import logging

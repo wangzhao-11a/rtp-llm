@@ -1,4 +1,4 @@
-"""Compare both legacy cache layouts against FP32 scores on GB200."""
+"""Compare both legacy cache layouts against FP32 scores on the SM100_ARM pool."""
 
 import unittest
 

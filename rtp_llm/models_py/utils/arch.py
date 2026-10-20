@@ -36,7 +36,7 @@ def is_sm90(device_id: Optional[Union[int, torch.device]] = None) -> bool:
 
 
 def is_sm10x(device_id: Optional[Union[int, torch.device]] = None) -> bool:
-    """SM 10.x datacenter Blackwell (B200 / GB200)."""
+    """SM 10.x datacenter Blackwell (SM100)."""
     if not is_cuda():
         return False
     return get_sm(device_id)[0] == 10
@@ -65,7 +65,7 @@ def is_sm12x(device_id: Optional[Union[int, torch.device]] = None) -> bool:
 
 
 def is_blackwell(device_id: Optional[Union[int, torch.device]] = None) -> bool:
-    """Blackwell-class: SM 10.x datacenter (B200/GB200) or SM 12.x consumer."""
+    """Blackwell-class: SM 10.x datacenter (SM100) or SM 12.x consumer."""
     if not is_cuda():
         return False
     return get_sm(device_id)[0] in (10, 12)

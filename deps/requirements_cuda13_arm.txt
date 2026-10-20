@@ -1,4 +1,4 @@
-# CUDA 13 / aarch64 (GB200 / GB300) dep set.
+# CUDA 13 / aarch64 (SM100_ARM / SM103) dep set.
 # Matches the x86 cuda13 pattern: only self-built wheels against torch 2.11+cu130.
 # Packages that link libcudart.so.12 (flash_attn, fast_hadamard,
 # nvidia_cutlass_dsl) are deferred.
