@@ -5,6 +5,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include "autil/EnvUtil.h"
 #include "torch/all.h"
 
 #define private public
@@ -110,6 +111,99 @@ TEST_P(EngineStopTest, StopWaitsForInFlightDecodeDispatch) {
 
 TEST_P(EngineStopTest, StopWaitsForInFlightPrefillOnlyDispatch) {
     checkStopWaitsForDispatch(0);
+}
+
+TEST_P(EngineStopTest, StopWakesIdleSchedulerWhilePaused) {
+    CustomConfig config;
+    config.output_dispatcher_worker_count = GetParam();
+    auto engine                           = createMockEngine(config);
+    engine->pause();
+    auto stopped = std::async(std::launch::async, [&] { return engine->stop(); });
+    EXPECT_EQ(stopped.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_TRUE(stopped.get().ok());
+    EXPECT_FALSE(engine->running_.load());
+    EXPECT_EQ(engine->executor_, nullptr);
+    EXPECT_TRUE(engine->stop().ok());
+}
+
+TEST_P(EngineStopTest, OrdinaryDpAndFfnStopNeedNoWorldCollective) {
+    auto engine = createMockEngine(CustomConfig{});
+    ASSERT_TRUE(engine->stop().ok());
+    // No communication callbacks are registered in this fixture. Generic DP
+    // and FFN roles must never enter the SM120 WORLD scheduling protocol.
+    for (bool ffn : {false, true}) {
+        engine->ffn_disaggregate_config.enable_ffn_disaggregate = ffn;
+        for (int tp_size : {1, 2}) {
+            engine->parallelism_config.dp_size = 4;
+            engine->parallelism_config.tp_size = tp_size;
+            for (bool stop : {false, true}) {
+                engine->stop_requested_ = stop;
+                EXPECT_EQ(engine->synchronizeStopRequested(), stop);
+            }
+        }
+    }
+}
+
+TEST_P(EngineStopTest, ActiveTpStepDoesNotAddAControlCollective) {
+    auto engine = createMockEngine(CustomConfig{});
+    ASSERT_TRUE(engine->stop().ok());
+    engine->parallelism_config.tp_size = 2;
+    engine->parallelism_config.dp_size = 1;
+    engine->stop_requested_            = false;
+    for (int rank : {0, 1}) {
+        engine->parallelism_config.tp_rank = rank;
+        EXPECT_FALSE(engine->synchronizeStopRequested());
+    }
+}
+
+TEST_P(EngineStopTest, StoppedSchedulerRejectsNewRequests) {
+    auto engine = createMockEngine(CustomConfig{});
+    EXPECT_FALSE(engine->isStopping());
+    ASSERT_TRUE(engine->stop().ok());
+    EXPECT_TRUE(engine->isStopping());
+    auto query                             = std::make_shared<GenerateInput>();
+    query->input_ids                       = torch::tensor({1, 2}, torch::kInt32);
+    query->generate_config                 = std::make_shared<GenerateConfig>();
+    query->generate_config->max_new_tokens = 2;
+    auto stream                            = engine->enqueue(query);
+    EXPECT_TRUE(stream->hasError());
+    EXPECT_TRUE(engine->scheduler_->empty());
+    auto [accepted, streams] = engine->enqueueMultiple({query, query});
+    EXPECT_EQ(accepted, std::vector<bool>({false, false}));
+    ASSERT_EQ(streams.size(), 2);
+    EXPECT_TRUE(streams[0]->hasError());
+    EXPECT_TRUE(streams[1]->hasError());
+    EXPECT_TRUE(engine->scheduler_->empty());
+}
+
+TEST_P(EngineStopTest, ConcurrentStopCallsComplete) {
+    auto engine = createMockEngine(CustomConfig{});
+    auto first  = std::async(std::launch::async, [&] { return engine->stop(); });
+    auto second = std::async(std::launch::async, [&] { return engine->stop(); });
+    EXPECT_EQ(first.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_EQ(second.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_TRUE(first.get().ok());
+    EXPECT_TRUE(second.get().ok());
+    EXPECT_EQ(engine->executor_, nullptr);
+}
+
+TEST_P(EngineStopTest, InvalidFixedDecodeBatchFailsBeforeDistributedStartup) {
+    ModelConfig   model;
+    RuntimeConfig runtime;
+    KVCacheConfig cache;
+    auto          params                      = createEngineInitParams(CustomConfig{}, model, runtime, cache);
+    params.moe_config.moe_strategy            = "sm120_decode";
+    params.hw_kernel_config.enable_cuda_graph = true;
+    params.pd_sep_config.role_type            = RoleType::DECODE;
+    params.parallelism_config.tp_size         = 1;
+    params.parallelism_config.dp_size         = 8;
+    params.parallelism_config.ep_size         = 8;
+    params.parallelism_config.world_size      = 8;
+    for (const char* value : {"1", "-1", "invalid", "4x"}) {
+        SCOPED_TRACE(value);
+        autil::EnvGuard fixed_batch("RTP_LLM_DECODE_FIXED_BS", value);
+        EXPECT_THROW(std::make_shared<NormalEngine>(params, nullptr), std::invalid_argument);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(SerialAndParallel, EngineStopTest, ::testing::Values(0, 2));

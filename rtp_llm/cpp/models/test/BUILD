@@ -7,9 +7,9 @@ test_copts = [
     "-fno-access-control",
 ] + copts()
 
-cc_import(
+alias(
     name = "cuda13_torch_nvshmem",
-    shared_library = "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",
+    actual = "@//:cuda13_torch_nvshmem",
 )
 
 cuda13_torch_link_deps = select({
@@ -31,20 +31,23 @@ test_deps = [
     "@local_config_cuda//cuda:cudart",
 ] + torch_deps() + cuda13_torch_link_deps
 
-cc_test(
-    name = "model_data_test",
-    srcs = [
-        "ModelDataTest.cc",
-    ],
-    data = [],
-    copts = test_copts,
-    deps = test_deps + ["//rtp_llm/cpp/distribute:cpu_tp_broadcaster"],
-    env = {
-        "TEST_USING_DEVICE": "CUDA",
-    },
-    exec_properties = {"gpu": "L20_CU13"},
-    tags = ["L20_CU13"],
-)
+[
+    cc_test(
+        name = "model_data{}_test".format(suffix),
+        visibility = ["//rtp_llm/models_py/modules/dsv4/test:__pkg__"],
+        srcs = ["ModelDataTest.cc"],
+        copts = test_copts,
+        deps = test_deps + ["//rtp_llm/cpp/distribute:cpu_tp_broadcaster"],
+        env = {"TEST_USING_DEVICE": "CUDA"},
+        exec_properties = {"gpu": gpu},
+        tags = [gpu],
+        target_compatible_with = select({
+            "@//:using_cuda13_sm120": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }) if suffix else [],
+    )
+    for suffix, gpu in [("", "L20_CU13"), ("_sm120", "RTX_5000_PRO_CU13")]
+]
 
 cc_test(
     name = "model_inputs_logger_test",

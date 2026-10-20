@@ -3,9 +3,9 @@ load("//bazel:arch_select.bzl", "torch_deps")
 
 cc_test = cc_test_wrapper
 
-cc_import(
+alias(
     name = "cuda13_torch_nvshmem",
-    shared_library = "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",
+    actual = "@//:cuda13_torch_nvshmem",
 )
 
 cuda13_torch_link_deps = select({
@@ -278,6 +278,14 @@ cc_test(
     env = {},
     exec_properties = {"gpu": "L20_CU13"},
     tags = ["L20_CU13"],
+)
+
+cc_test(
+    name = "kv_cache_metrics_lifecycle_test",
+    srcs = ["KVCacheMetricsLifecycleTest.cc"],
+    copts = test_copts,
+    deps = test_deps,
+    timeout = "short",
 )
 
 cc_test(

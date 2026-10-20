@@ -43,6 +43,7 @@ struct GptModelDescription {
     // description produced by Executor::genModelDescription so every model
     // construction path receives the same fail-closed eligibility inputs.
     MoeConfig moe_runtime_config;
+    bool      uses_default_position_ids = false;
 };
 
 struct GptModelInitParams {
@@ -175,6 +176,7 @@ enum GptModelInputControlFlag : uint32_t {
     kControlPdSeparation        = 1u << 7,
     kControlDecodeEntrance      = 1u << 8,
     kControlOpaqueKvCacheStore  = 1u << 9,
+    kControlStopExecution       = 1u << 10,
 };
 
 GptModelInputShapeHints getModelInputShapeHints(const GptModelInputs& inputs);

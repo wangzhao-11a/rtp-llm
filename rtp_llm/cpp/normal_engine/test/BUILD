@@ -8,9 +8,9 @@ test_copts = [
     "-fno-access-control",
 ] + copts()
 
-cc_import(
+alias(
     name = "cuda13_torch_nvshmem",
-    shared_library = "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",
+    actual = "@//:cuda13_torch_nvshmem",
 )
 
 cuda13_torch_link_deps = select({
@@ -121,7 +121,7 @@ cc_test(
 # The executor caches RTP_LLM_STREAM_ASYNC, so test both settings in fresh processes.
 [
     cc_test(
-        name = "engine_stop_{}_test".format(mode),
+        name = "engine_stop_{}{}_test".format(mode, suffix),
         srcs = ["EngineStopTest.cc"],
         copts = test_copts,
         env = select({
@@ -135,12 +135,30 @@ cc_test(
                 "RTP_LLM_STREAM_ASYNC": stream_async,
             },
         }),
-        exec_properties = {"gpu": "L20_CU13"},
-        tags = ["L20_CU13"],
+        exec_properties = {"gpu": gpu},
+        tags = [gpu],
+        target_compatible_with = select({
+            "@//:using_cuda13_sm120": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }) if suffix else [],
         deps = [":mock_engine"] + cuda13_torch_link_deps,
+        visibility = ["//rtp_llm/models_py/modules/dsv4/test:__pkg__"],
     )
     for mode, stream_async in [
         ("sync", "0"),
         ("async", "1"),
     ]
+    for suffix, gpu in [("", "L20_CU13"), ("_sm120", "RTX_5000_PRO_CU13")]
 ]
+
+cc_test(
+    name = "dsv4_dp_prefill_policy_test",
+    srcs = ["Dsv4DpPrefillPolicyTest.cc"],
+    copts = test_copts,
+    deps = [
+        "//rtp_llm/cpp/normal_engine:dsv4_dp_prefill_policy",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+    visibility = ["//rtp_llm/models_py/modules/dsv4/test:__pkg__"],
+)

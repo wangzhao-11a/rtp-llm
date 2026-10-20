@@ -2,6 +2,8 @@
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
+#include "rtp_llm/cpp/normal_engine/Dsv4DpPrefillPolicy.h"
+#include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
@@ -92,7 +94,7 @@ public:
         resource_context_.cache_manager = std::move(previous_cache_manager_);
     }
 
-    ScopedWarmUpCacheManagerBinding(const ScopedWarmUpCacheManagerBinding&) = delete;
+    ScopedWarmUpCacheManagerBinding(const ScopedWarmUpCacheManagerBinding&)            = delete;
     ScopedWarmUpCacheManagerBinding& operator=(const ScopedWarmUpCacheManagerBinding&) = delete;
 
 private:
@@ -162,6 +164,47 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
             "GENERATION_PREFILL_CAPTURE_CONFIG does not support speculative execution in the first version; "
             "remove the generation-prefill configuration when using speculative execution on PDFUSION (type=%s)",
             SpeculativeExecutionConfig::to_string(sp_config.type).c_str());
+    }
+    const auto resolved_moe_strategy = resolveModelMoeStrategy(
+        model_config_.model_type, params.moe_config.moe_strategy, std::getenv("DSV4_MOE_STRATEGY"));
+    RTP_LLM_CHECK_WITH_INFO(!(resolved_moe_strategy == "sm120_decode" && parallelism_config.dp_size > 1
+                              && pd_sep_config.role_type == RoleType::PDFUSION && sp_config.type != SP_TYPE_NONE),
+                            "sm120_decode with speculative DP requires separate PREFILL and DECODE roles; "
+                            "speculative PDFUSION does not synchronize rank-local prefill/decode batches");
+    dp_prefill_phase_sync_ = dsv4DpPrefillPhaseSyncEnabled(model_config_.model_type,
+                                                           resolved_moe_strategy.c_str(),
+                                                           pd_sep_config.role_type,
+                                                           parallelism_config.pp_size,
+                                                           parallelism_config.tp_size,
+                                                           parallelism_config.dp_size,
+                                                           parallelism_config.ep_size,
+                                                           parallelism_config.world_size,
+                                                           sp_config.type != SP_TYPE_NONE,
+                                                           parallelism_config.prefill_cp_config.is_enabled(),
+                                                           ffn_disaggregate_config.enable_ffn_disaggregate);
+    dp_decode_batch_sync_  = params.hw_kernel_config.enable_cuda_graph && resolved_moe_strategy == "sm120_decode"
+                            && !ffn_disaggregate_config.enable_ffn_disaggregate
+                            && !parallelism_config.prefill_cp_config.is_enabled() && parallelism_config.pp_size == 1
+                            && parallelism_config.tp_size == 1 && parallelism_config.dp_size > 1
+                            && parallelism_config.ep_size == parallelism_config.dp_size
+                            && parallelism_config.world_size == parallelism_config.dp_size
+                            && (pd_sep_config.role_type == RoleType::DECODE || dp_prefill_phase_sync_);
+    if (dp_decode_batch_sync_ || (pd_sep_config.role_type == RoleType::DECODE && isMTPEagle())) {
+        if (const char* value = std::getenv("RTP_LLM_DECODE_FIXED_BS"); value && *value) {
+            size_t parsed = 0;
+            try {
+                decode_fixed_bs_ = std::stoi(value, &parsed);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("RTP_LLM_DECODE_FIXED_BS must be a nonnegative integer");
+            }
+            if (value[parsed] != '\0' || decode_fixed_bs_ < 0) {
+                throw std::invalid_argument("RTP_LLM_DECODE_FIXED_BS must be a nonnegative integer");
+            }
+            if (decode_fixed_bs_ > 0 && runtime_config.max_generate_batch_size > decode_fixed_bs_) {
+                throw std::invalid_argument("max_generate_batch_size must not exceed RTP_LLM_DECODE_FIXED_BS; "
+                                            "increase the fixed batch or reduce the scheduler limit");
+            }
+        }
     }
     if (!model_config_.output_vocab_ids.empty()) {
         RTP_LLM_CHECK_WITH_INFO(sp_config.type == SP_TYPE_NONE && !propose_params_,
@@ -332,7 +375,7 @@ absl::StatusOr<GenerateStreamPtr> NormalEngine::preRun(const std::shared_ptr<Gen
                                                        preRunMode                            mode) {
     c10::InferenceMode inference_guard(true);
 
-    auto stream = std::make_shared<NormalGenerateStream>(generate_input,
+    auto       stream       = std::make_shared<NormalGenerateStream>(generate_input,
                                                          model_config_,
                                                          runtime_config,
                                                          resource_context_,
@@ -531,7 +574,7 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
         ScopedWarmUpCacheManagerBinding cache_binding(resource_context_, cache_manager);
         THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::decode_warm_up));
     }
-    const auto max_consumed         = getGpuExecStatus().device_memory_status.max_consumed_bytes;
+    const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
     rtp_llm::setTraceMemory(false);
     (void)executor_.reset(nullptr);
     cudaDeviceSynchronize();
@@ -541,7 +584,7 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
 #endif
 }
 
-std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_new_tokens) {
+std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_new_tokens, bool prefill_only) {
     RTP_LLM_LOG_DEBUG("create min fake query");
     auto fake_input                             = makeFakeInput(1);
     fake_input->generate_config->max_new_tokens = max_new_tokens;
@@ -550,7 +593,8 @@ std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_ne
     stream->setIsFakeStream(true);
     stream->setMetricsReporter(nullptr);
     stream->fakeInitKVBlock();
-    if (pd_sep_config.role_type == RoleType::PDFUSION || pd_sep_config.role_type == RoleType::DECODE) {
+    if (!prefill_only
+        && (pd_sep_config.role_type == RoleType::PDFUSION || pd_sep_config.role_type == RoleType::DECODE)) {
         auto new_tokens = torch::zeros({1, 1}, torch::kInt32);
 
         StreamUpdateInfo update_info{new_tokens,
@@ -662,19 +706,33 @@ absl::Status NormalEngine::startLoop() {
         RTP_LLM_LOG_INFO("init system prompt done");
     }
     RTP_LLM_LOG_INFO("start normal engine loop");
-    running_     = true;
-    loop_thread_ = autil::Thread::createThread(std::bind(&NormalEngine::loop, this), "normal_engine_loop");
+    stop_requested_ = false;
+    running_        = true;
+    loop_thread_    = autil::Thread::createThread(std::bind(&NormalEngine::loop, this), "normal_engine_loop");
     return absl::OkStatus();
 }
 
 absl::Status NormalEngine::stop() {
+    std::lock_guard<std::mutex> lock(stop_mutex_);
     RTP_LLM_LOG_INFO("stop normal engine");
-    running_ = false;
+    stop_requested_ = true;
     RETURN_IF_STATUS_ERROR(scheduler_->stop());
-    loop_thread_->join();
+    if (loop_thread_) {
+        loop_thread_->join();
+    }
     // Join the async dispatch runner and release the dispatcher-owned worker pool.
     executor_.reset();
-    resource_context_.cache_manager->stopMetricsReporter();
+    // Python models, streams and RPC owners can retain the cache manager after
+    // engine stop, so its destructor is too late to quiesce reporting.
+    if (resource_context_.cache_manager) {
+        resource_context_.cache_manager->stopMetricsReporter();
+        // The cache store's TCP transport runs ANet metric reporter threads into
+        // the process-global kmonitor; destructor-only teardown can run after the
+        // kmonitor factory shuts down. Cache buffers stay intact for their owners.
+        if (auto cache_store = resource_context_.cache_manager->getCacheStore()) {
+            cache_store->stopTransport();
+        }
+    }
     return absl::OkStatus();
 }
 
@@ -690,6 +748,40 @@ void NormalEngine::loop() {
             THROW_IF_STATUS_ERROR(trySaveStepError());
         }
     }
+}
+
+bool NormalEngine::synchronizeStopRequested() {
+    const bool local_stop = stop_requested_.load();
+    // SM120 DP/EP coordinates stop in its existing scheduling reduction.
+    // Other DP topologies and FFN disaggregation retain their local protocol;
+    // a WORLD collective here would involve unrelated serving roles.
+    if (ffn_disaggregate_config.enable_ffn_disaggregate || parallelism_config.dp_size > 1) {
+        return local_stop;
+    }
+    if (parallelism_config.tp_size > 1) {
+        // The root sends one terminal model-input frame. Ordinary iterations
+        // retain exactly the same collective order as system-prompt preRun().
+        if (parallelism_config.tp_rank == 0 && local_stop) {
+            executor_->stopTpExecution(parallelism_config);
+            return true;
+        }
+        return false;
+    }
+    return local_stop;
+}
+
+std::optional<int64_t> NormalEngine::synchronizeDpStepState(int64_t local_value) {
+    // Only the admitted TP1/DP=EP=WORLD profile calls this. Carry shutdown in
+    // the existing scalar MAX: the terminal vote dominates any batch extent.
+    constexpr int64_t stop_vote = std::numeric_limits<int64_t>::max();
+    auto              state     = torch::full({1},
+                             running_ && stop_requested_ ? stop_vote : local_value,
+                             torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    const auto value = execAllReduce({state, ReduceOp::Max, false, ParallelMode::DP_AND_TP}).buffer.item<int64_t>();
+    if (value == stop_vote) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 absl::Status NormalEngine::trySaveStepError() const {
@@ -823,7 +915,7 @@ NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>&
 
 absl::Status NormalEngine::step() try {
     RTP_LLM_PROFILE_SCOPE("engine.normal.step_work");
-    while (pause_) {
+    while (pause_ && !stop_requested_) {
         // wait 50ms if system paused.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -835,7 +927,21 @@ absl::Status NormalEngine::step() try {
             RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule(reserve_step=%d)", reserve_step_);
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
         }
-        if (parallelism_config.dp_size > 1) {
+    }
+    // DP/EP must reach its existing scheduling collective even when the local
+    // stop request arrives before another rank's. Do not vote a second time.
+    const bool aligned_dp = dp_prefill_phase_sync_ || dp_decode_batch_sync_;
+    const bool stop       = aligned_dp ? mayAddFakeStream(streams) : (running_ && synchronizeStopRequested());
+    if (stop) {
+        stop_requested_ = true;
+        running_        = false;
+        // A peer may receive the shared stop before its own RPC drain begins.
+        // Wake its requests too, so shutdown cannot wait on an exited engine.
+        RETURN_IF_STATUS_ERROR(scheduler_->stop());
+        return absl::OkStatus();
+    }
+    if (parallelism_config.tp_rank == 0 && !ffn_disaggregate_config.is_ffn_service()) {
+        if (parallelism_config.dp_size > 1 && !aligned_dp) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
         }
@@ -875,6 +981,12 @@ absl::Status NormalEngine::step() try {
         if (propose_params_) {
             step_profiler_.finishStep();
         }
+    }
+
+    if (executor_->executionStopped()) {
+        stop_requested_ = true;
+        running_        = false;
+        RETURN_IF_STATUS_ERROR(scheduler_->stop());
     }
 
     // report step metrics
@@ -937,7 +1049,63 @@ bool NormalEngine::shouldAddMtpFakePrefill(bool has_prefill, bool use_batch_deco
     return !has_prefill && (!use_batch_decode_scheduler || dp_size > 1);
 }
 
-void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
+bool NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
+    bool stopped = false;
+    if (dp_prefill_phase_sync_) {
+        const bool local_decode =
+            std::any_of(streams.begin(), streams.end(), [](const auto& stream) { return !stream->isContextStream(); });
+        auto reduce_any_prefill = [this, local_decode, &stopped](bool local_prefill) -> std::optional<bool> {
+            auto state = synchronizeDpStepState(dsv4DpPhaseVote(local_prefill, local_decode, dp_previous_prefill_));
+            stopped    = !state;
+            if (!state) {
+                return std::nullopt;
+            }
+            dp_previous_prefill_ = dsv4DpPhaseIsPrefill(*state, dp_previous_prefill_);
+            return dp_previous_prefill_;
+        };
+        if (alignDsv4DpPrefillPhase(streams, reduce_any_prefill, [this] { return createMinFakeStream(1, true); })) {
+            RTP_LLM_LOG_DEBUG("DSV4 DP/EP: synchronized prefill phase, streams=%zu", streams.size());
+            return false;
+        }
+        if (stopped) {
+            return true;
+        }
+        // Prefills deferred by the global decode phase remain scheduler-owned.
+        streams.remove_if([](const auto& stream) { return stream->isContextStream(); });
+    }
+    if (dp_decode_batch_sync_) {
+        if (!isMTPEagle()
+            && std::any_of(streams.begin(), streams.end(), [](const auto& stream) { return stream->hasNumBeams(); })) {
+            // Beam counts depend on committed token length. Freeze the prior
+            // async step before deciding the common EP payload extent.
+            auto* normal_executor = dynamic_cast<NormalExecutor*>(executor_.get());
+            RTP_LLM_CHECK_WITH_INFO(normal_executor != nullptr, "SM120 beam alignment requires NormalExecutor");
+            normal_executor->syncStreamState();
+        }
+        auto reduce_max_batch = [this, &stopped](int64_t local_batch) {
+            auto state = synchronizeDpStepState(local_batch);
+            stopped    = !state;
+            return state;
+        };
+        alignDsv4DpDecodeBatch(
+            streams,
+            reduce_max_batch,
+            [this] {
+                if (isMTPEagle()) {
+                    return MtpExecutor::createMinFakeDecodeStream(
+                        sp_config.gen_num_per_cycle,
+                        model_config_,
+                        runtime_config,
+                        resource_context_,
+                        propose_params_->getEngineInitParams().model_config_.vocab_size,
+                        isDSpark());
+                }
+                return createMinFakeStream(1);
+            },
+            decode_fixed_bs_,
+            isMTPEagle());
+        return stopped;
+    }
     if (isMTPEagle()) {
         int        propose_step   = sp_config.gen_num_per_cycle;
         int        mtp_vocab_size = propose_params_->getEngineInitParams().model_config_.vocab_size;
@@ -949,12 +1117,21 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
                         MtpExecutor::createMinFakePrefillStream(1, model_config_, runtime_config, resource_context_));
                 }
                 break;
-            case RoleType::DECODE:
-                if (streams.empty()) {
+            case RoleType::DECODE: {
+                const int fixed_bs = decode_fixed_bs_;
+                if (fixed_bs > 0) {
+                    RTP_LLM_CHECK_WITH_INFO(static_cast<int>(streams.size()) <= fixed_bs,
+                                            "decode batch exceeds RTP_LLM_DECODE_FIXED_BS");
+                    while (static_cast<int>(streams.size()) < fixed_bs) {
+                        streams.emplace_back(MtpExecutor::createMinFakeDecodeStream(
+                            propose_step, model_config_, runtime_config, resource_context_, mtp_vocab_size, is_dspark));
+                    }
+                } else if (streams.empty()) {
                     streams.emplace_back(MtpExecutor::createMinFakeDecodeStream(
                         propose_step, model_config_, runtime_config, resource_context_, mtp_vocab_size, is_dspark));
                 }
                 break;
+            }
             case RoleType::PDFUSION: {
                 bool has_prefill = false;
                 bool has_decode  = false;
@@ -985,6 +1162,7 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
             streams.emplace_back(createMinFakeStream(1));
         }
     }
+    return false;
 }
 
 }  // namespace rtp_llm
