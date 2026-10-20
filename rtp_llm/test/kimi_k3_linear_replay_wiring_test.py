@@ -7,8 +7,11 @@ from unittest.mock import patch
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from rtp_llm.models_py.model_desc import kimi_linear, qwen3_next
+from rtp_llm.models_py.model_desc import qwen3_next
 from rtp_llm.models_py.modules.factory.attention import kda_impl
+from rtp_llm.models_py.modules.kimi_k3.kernel_jit_warmup import (
+    _inactive_replay_inputs,
+)
 
 
 class KimiK3LinearReplayWiringTest(unittest.TestCase):
@@ -18,9 +21,7 @@ class KimiK3LinearReplayWiringTest(unittest.TestCase):
             def tensor(shape):
                 return torch.empty(shape, device="cuda:0", dtype=torch.bfloat16)
 
-            decode = kimi_linear.KimiLinearKDADecode.__new__(
-                kimi_linear.KimiLinearKDADecode
-            )
+            decode = kda_impl.KdaDecode.__new__(kda_impl.KdaDecode)
             torch.nn.Module.__init__(decode)
             decode.local_num_k_heads = 1
             decode.local_num_v_heads = 1
@@ -40,7 +41,7 @@ class KimiK3LinearReplayWiringTest(unittest.TestCase):
                 group_id=3,
             )
             attn_inputs = SimpleNamespace(linear_replay=replay_inputs)
-            metadata = kimi_linear.KimiLinearMetadata(is_target_verify=True)
+            metadata = kda_impl.KdaMetadata(is_target_verify=True)
             mixed_qkv = tensor((4, 384))
             forget_gate = tensor((4, 128))
             beta = tensor((4, 1))
@@ -119,10 +120,30 @@ class LinearReplayDispatchTest(unittest.TestCase):
                 self.assertIs(conv.call_args.args[0], projected)
                 self.assertTrue(conv.call_args.args[-1])
                 self.assertIs(fla.call_args.args[0], convolved)
+                self.assertIs(fla.call_args.args[-2], inputs)
                 if module is kda_impl:
-                    self.assertTrue(fla.call_args.args[-1])
+                    self.assertIs(fla.call_args.args[-1], True)
                 else:
-                    self.assertTrue(fla.call_args.args[-1].is_target_verify)
+                    self.assertIs(fla.call_args.args[-1], metadata)
+
+
+class KimiK3ReplayWarmupMetadataTest(unittest.TestCase):
+    def test_inactive_metadata_prepares_both_alignments_for_every_group(self):
+        for group in (0, 1, 2, 5):
+            for batch in (1, 2):
+                for unaligned in (False, True):
+                    inputs = _inactive_replay_inputs(
+                        group, torch.device("cpu"), batch, unaligned=unaligned
+                    )
+                    self.assertEqual(inputs.slot_ids.tolist(), [-1] * batch)
+                    for metadata in (
+                        inputs.state_read_block_ids,
+                        inputs.active_block_ids,
+                    ):
+                        self.assertEqual(
+                            metadata[group].data_ptr() % 16, 4 if unaligned else 0
+                        )
+                        self.assertEqual(metadata[group].tolist(), [-1] * batch)
 
 
 if __name__ == "__main__":
