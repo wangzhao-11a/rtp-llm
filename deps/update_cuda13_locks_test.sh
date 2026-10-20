@@ -13,6 +13,8 @@ fi
 
 x86=$($script x86 --print-command)
 arm=$($script arm --print-command)
+sm120=$($script sm120 --print-command)
+sm120_internal=$($script sm120-internal --print-command)
 
 [[ "$x86" == *"requirements_torch_gpu_cuda13.txt"* ]]
 [[ "$x86" == *"requirements_cuda13_overrides.txt"* ]]
@@ -22,3 +24,9 @@ arm=$($script arm --print-command)
 [[ "$arm" == *"requirements_cuda13_overrides.txt"* ]]
 [[ "$arm" == *"aarch64-manylinux_2_28"* ]]
 [[ "$arm" == *"requirements_cuda13_arm.update"* ]]
+[[ "$sm120" == *"requirements_torch_gpu_cuda13_sm120.txt"* ]]
+[[ "$sm120" == *"requirements_cuda13_overrides.txt"* ]]
+[[ "$sm120" == *"x86_64-manylinux_2_28"* ]]
+[[ "$sm120" == *"//deps:requirements_torch_gpu_cuda13_sm120.update"* ]]
+[[ "$sm120_internal" == *"internal_source/deps/requirements_torch_gpu_cuda13_sm120.txt"* ]]
+[[ "$sm120_internal" == *"//internal_source/deps:requirements_torch_gpu_cuda13_sm120.update"* ]]
