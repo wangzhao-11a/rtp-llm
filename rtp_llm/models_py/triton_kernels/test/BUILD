@@ -1,4 +1,17 @@
 py_test(
+    name = "jit_specialization_test",
+    srcs = ["jit_specialization_test.py"],
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:mla",
+        "//rtp_llm/models_py/triton_kernels:moe",
+        "//rtp_llm:torch",
+        "//rtp_llm:triton",
+    ],
+    exec_properties = {"gpu": "SM103_CU13", "gpu_count": "1"},
+    tags = ["SM103_CU13"],
+)
+
+py_test(
     name = "legacy_fp8_indexer_score_test",
     srcs = ["legacy_fp8_indexer_score_test.py"],
     deps = ["//rtp_llm:testlib"],
