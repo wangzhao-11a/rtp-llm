@@ -334,6 +334,9 @@ def set_parallelism_config(
         assert (
             parallelism_config.tp_size == 1 and parallelism_config.world_size > 1
         ), "enable_ffn_disaggregate must be used in dp = 1 world_size > 1"
+        assert (
+            parallelism_config.pp_size == 1
+        ), "pipeline parallelism does not support FFN disaggregation"
         attention_dp_size = parallelism_config.world_size - 1
         attention_tp_size = 1
         ffn_tp_size = 1

@@ -585,6 +585,7 @@ def make_minimal_configs(
         dp_size=1,
         dp_rank=0,
         world_size=1,
+        world_rank=0,
         local_world_size=1,
         get_ffn_tp_rank=lambda: 0,
         get_ffn_tp_size=lambda: 1,
@@ -600,21 +601,25 @@ def make_minimal_configs(
 
 class EplbNodeCountTest(unittest.TestCase):
     def test_pp_node_count_belongs_to_the_ep_group_and_pp1_keeps_main(self):
-        # (PP, TP, DP, EP, local world size, nodes per EP group)
-        for pp, tp, dp, ep, local, expected in (
-            (1, 1, 8, 8, 8, 1),
-            (1, 1, 16, 8, 8, 2),
-            (2, 1, 8, 8, 8, 1),
-            (2, 1, 16, 16, 8, 2),
-            (2, 8, 1, 1, 8, 1),
+        # (PP, PP rank, TP, DP, EP, local world size, nodes per EP group)
+        for pp, pp_rank, tp, dp, ep, local, expected in (
+            (1, 0, 1, 8, 8, 8, 1),
+            (1, 0, 1, 16, 8, 8, 2),
+            (2, 0, 1, 8, 8, 8, 1),
+            (2, 0, 1, 16, 16, 8, 2),
+            (2, 0, 8, 1, 1, 8, 1),
+            # 12 ranks over 3 machines of 4: each 6-rank EP group spans 2.
+            (2, 0, 2, 3, 6, 4, 2),
+            (2, 1, 2, 3, 6, 4, 2),
         ):
-            with self.subTest(pp=pp, tp=tp, dp=dp, ep=ep):
+            with self.subTest(pp=pp, pp_rank=pp_rank, tp=tp, dp=dp, ep=ep):
                 model, parallel, hw = make_minimal_configs()
-                parallel.pp_size, parallel.pp_rank = pp, 0
+                parallel.pp_size, parallel.pp_rank = pp, pp_rank
                 parallel.pp_stage_layer_counts = [1] * pp
                 parallel.tp_size, parallel.dp_size = tp, dp
                 parallel.ep_size = ep
                 parallel.world_size = pp * tp * dp
+                parallel.world_rank = pp_rank * tp * dp
                 parallel.local_world_size = local
                 parallel.get_attn_tp_size = lambda: tp
                 model.num_layers = pp

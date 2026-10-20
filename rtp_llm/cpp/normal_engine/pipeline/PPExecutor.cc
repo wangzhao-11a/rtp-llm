@@ -298,6 +298,10 @@ void PPExecutor::validateConfig(const EngineInitParams& params) {
                             "pipeline parallelism does not support the remote KV cache tier: KVCM location specs "
                             "are keyed by tp_rank alone and its deployment identity carries no pp_size, so only "
                             "the first stage's layers would reach the remote tier");
+
+#if USING_ROCM
+    RTP_LLM_FAIL("pipeline parallelism is not validated on ROCm");
+#endif
 }
 
 PPExecutor::PPExecutor(const EngineInitParams&                params,
