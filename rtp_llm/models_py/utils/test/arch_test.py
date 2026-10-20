@@ -55,6 +55,49 @@ class ArchTest(TestCase):
             self.assertFalse(arch.is_blackwell(2))
             self.assertEqual(queried_devices, [1, 0, 2])
 
+    def test_mhc_backend_resolver_canonicalizes_overrides(self):
+        for value, expected in (
+            ("dg", "deepgemm"),
+            ("tilelang", "tilelang_single"),
+            ("single", "tilelang_single"),
+            ("tilelang_splitk", "tilelang_splitk"),
+        ):
+            with (
+                self.subTest(value=value),
+                patch.dict(
+                    "os.environ", {"DSV4_MHC_PRE_GEMM_BACKEND": value}, clear=True
+                ),
+            ):
+                self.assertEqual(
+                    arch.mhc_pre_gemm_backend(torch.device("cpu")), expected
+                )
+
+    def test_sm120_requires_exact_cuda_capability(self):
+        for capability in ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1)):
+            with (
+                self.subTest(capability=capability),
+                patch.object(arch, "is_cuda", return_value=True),
+                patch.object(arch, "get_sm", return_value=capability),
+            ):
+                self.assertEqual(arch.is_sm120(0), capability == (12, 0))
+
+    def test_sm120_rejects_non_cuda_without_querying_capability(self):
+        with patch.object(arch, "get_sm") as get_sm:
+            with patch.object(arch, "is_cuda", return_value=False):
+                self.assertFalse(arch.is_sm120())
+            with patch.object(arch, "is_cuda", return_value=True):
+                for device in ("cpu", torch.device("cpu")):
+                    self.assertFalse(arch.is_sm120(device))
+            get_sm.assert_not_called()
+
+    def test_mhc_backend_auto_uses_architecture(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(arch, "is_sm12x", side_effect=lambda device=None: device == 1),
+        ):
+            self.assertEqual(arch.mhc_pre_gemm_backend(1), "tilelang_single")
+            self.assertEqual(arch.mhc_pre_gemm_backend(0), "deepgemm")
+
 
 if __name__ == "__main__":
     main()
