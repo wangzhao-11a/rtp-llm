@@ -863,7 +863,10 @@ def _get_startup_real_warmup_request_token_len(
                 "model_args.max_seq_len should be greater than speculative "
                 f"reserve_step, got max_seq_len={max_len}, reserve_step={reserve_step}"
             )
-        max_request_token_len = min(max_request_token_len, max_len - reserve_step)
+        max_request_token_len = min(
+            max_request_token_len,
+            max_len - reserve_step - STARTUP_REAL_WARMUP_MAX_NEW_TOKENS,
+        )
     if max_request_token_len <= 0:
         raise ValueError(
             "startup real warmup request token len should be positive, got "

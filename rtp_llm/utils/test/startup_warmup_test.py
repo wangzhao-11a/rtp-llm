@@ -81,6 +81,7 @@ def load_startup_functions():
     names = {
         "_run_startup_real_warmup_grpc",
         "_maybe_run_startup_real_warmup",
+        "_get_startup_real_warmup_request_token_len",
         "start_server",
     }
     functions = [node for node in source.body if getattr(node, "name", None) in names]
@@ -100,7 +101,6 @@ def load_startup_functions():
         _get_startup_real_warmup_grpc_addresses=lambda _: ["test:1"],
         _get_startup_real_warmup_timeout_s=lambda: 10,
         _new_startup_real_warmup_request_id=lambda _: 123,
-        _get_startup_real_warmup_request_token_len=lambda *_: 8,
         _get_startup_real_warmup_max_new_tokens=lambda: 1,
         _should_run_startup_real_warmup=lambda _: True,
         _run_startup_real_warmup_async=asyncio.run,
@@ -110,6 +110,44 @@ def load_startup_functions():
         namespace,
     )
     return namespace
+
+
+class StartupWarmupRequestSizingTest(unittest.TestCase):
+    def setUp(self):
+        self.request_len = load_startup_functions()[
+            "_get_startup_real_warmup_request_token_len"
+        ]
+
+    def test_endpoint_reserves_speculative_window_and_one_output_token(self):
+        for reserve, expected in (
+            (1, 1048574),
+            (4, 1048571),
+            (7, 1048568),
+            (9, 1048566),
+        ):
+            with self.subTest(reserve=reserve):
+                actual = self.request_len(1048576, 1048576, reserve)
+                self.assertEqual(actual, expected)
+                self.assertLessEqual(actual + 1, 1048576 - reserve)
+
+    def test_rejects_boundary_without_both_prompt_and_output_space(self):
+        for maximum, reserve in ((1, 0), (4, 4), (5, 4)):
+            with self.subTest(maximum=maximum, reserve=reserve):
+                with self.assertRaises(ValueError):
+                    self.request_len(maximum, maximum, reserve)
+
+    def test_smallest_valid_speculative_prompt_keeps_one_output_token(self):
+        self.assertEqual(self.request_len(6, 6, 4), 1)
+
+    def test_nonendpoint_request_lengths_are_unchanged(self):
+        for length in (2, 8, 524288):
+            with self.subTest(length=length):
+                self.assertEqual(self.request_len(length, 1048576, 4), length)
+
+    def test_zero_reserve_keeps_existing_single_token_capacity(self):
+        self.assertEqual(self.request_len(1048576, 1048576, 0), 1048575)
+        self.assertEqual(self.request_len(2, 2, 0), 1)
+        self.assertEqual(self.request_len(8, 16, 0), 8)
 
 
 class StartupWarmupCompletionTest(unittest.IsolatedAsyncioTestCase):

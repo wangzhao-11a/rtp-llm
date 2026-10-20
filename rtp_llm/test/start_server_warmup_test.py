@@ -44,7 +44,7 @@ class StartupRealWarmupTest(unittest.TestCase):
                 max_len=1048576,
                 reserve_step=8,
             ),
-            1048568,
+            1048567,
         )
 
     def test_k3_prefill_entry_only_and_both_switches_required(self):
