@@ -1,6 +1,7 @@
 """CPU planning/dispatch checks; these do not claim GPU compilation coverage."""
 
 import ast
+import importlib.metadata
 import importlib.util
 import math
 import os
@@ -23,6 +24,43 @@ def load_warmup():
     spec = importlib.util.spec_from_file_location("k3_directed_under_test", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def load_sampling():
+    """Execute only the actual pure-Python selector closure, never GPU imports."""
+    path = HERE.parent.parent / "dsv41" / "dsv4_kernel_jit_warmup.py"
+    names = {
+        "_DENSE_GEMM_FALLBACK_M_GRID",
+        "_DENSE_GEMM_HEURISTIC_SCAN_LIMIT",
+        "_SM100_DENSE_BLOCK_M_CANDIDATES",
+        "_SM100_DENSE_BLOCK_N_CANDIDATES",
+        "_ceil_div",
+        "_align",
+        "_sm100_swizzle_mode",
+        "_sm100_dense_storage_signature",
+        "_sm100_bf16_k_mn_storage_signature",
+        "_sm100_dense_layout_info",
+        "_sm100_dense_layout_is_better",
+        "_sm100_dense_layout_signature",
+        "_candidate_dense_gemm_m_values",
+        "_generate_dense_gemm_warmup_m_grid",
+        "_dense_gemm_m_grid",
+    }
+    nodes = [
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in names
+        or isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id in names for t in node.targets)
+    ]
+    module = types.ModuleType("rtp_llm.models_py.modules.dsv41.dsv4_kernel_jit_warmup")
+    module.lru_cache = lru_cache
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"),
+        module.__dict__,
+    )
     return module
 
 
@@ -74,6 +112,191 @@ class KimiK3KDA:
 class BoundedProjectionWarmupTest(unittest.TestCase):
     def setUp(self):
         self.warmup = load_warmup()
+
+    def test_dg98_bf16_selector_prepares_both_observed_missing_layouts(self):
+        selector = load_sampling()
+        representatives = selector._generate_dense_gemm_warmup_m_grid(
+            max_m=838860,
+            n_value=3072,
+            k_value=512,
+            kind="dg98_bf16_k_mn",
+            num_sms=152,
+        )
+        signatures = [
+            selector._sm100_dense_layout_signature(
+                m_value=m,
+                n_value=3072,
+                k_value=512,
+                kind="dg98_bf16_k_mn",
+                num_sms=152,
+            )
+            for m in representatives
+        ]
+        # Independent numeric tuples from approved native metadata, not a GPU claim.
+        layouts = {s[:6] + (s[13],) for s in signatures}
+        self.assertTrue(
+            {(1, 256, 128, 64, 1, 2, 6), (1, 160, 128, 64, 1, 2, 8)} <= layouts, layouts
+        )
+
+    def test_dg98_bf16_sampler_unions_fallback_endpoint_and_uses_real_sms(self):
+        selector = load_sampling()
+        with mock.patch.dict(sys.modules, {selector.__name__: selector}), mock.patch(
+            "importlib.metadata.version", return_value="2.8.2+98a672e.cu132"
+        ):
+            samples = self.warmup._sample_m_values(
+                838859, 3072, 512, fp8=False, k_major=True, num_sms=152
+            )
+        old = set(selector._dense_gemm_m_grid(838859))
+        expected = selector._generate_dense_gemm_warmup_m_grid(
+            max_m=838859,
+            n_value=3072,
+            k_value=512,
+            kind="dg98_bf16_k_mn",
+            num_sms=152,
+        )
+        self.assertEqual(samples, tuple(sorted(old | set(expected))))
+        self.assertEqual(samples[-1], 838859)
+        self.assertNotEqual(
+            expected,
+            selector._generate_dense_gemm_warmup_m_grid(
+                max_m=838859,
+                n_value=3072,
+                k_value=512,
+                kind="dg98_bf16_k_mn",
+                num_sms=1,
+            ),
+        )
+
+    def test_bf16_sampler_wrong_version_or_layout_keeps_old_grid(self):
+        selector = load_sampling()
+        with mock.patch.dict(sys.modules, {selector.__name__: selector}):
+            for version, k_major in (
+                ("2.6.1+d029add", True),
+                ("2.8.2+98a672e.cu132", False),
+            ):
+                with self.subTest(version=version, k_major=k_major), mock.patch(
+                    "importlib.metadata.version", return_value=version
+                ):
+                    self.assertEqual(
+                        self.warmup._sample_m_values(
+                            1003, 3072, 512, fp8=False, k_major=k_major, num_sms=152
+                        ),
+                        tuple(selector._dense_gemm_m_grid(1003)),
+                    )
+            with mock.patch(
+                "importlib.metadata.version",
+                side_effect=importlib.metadata.PackageNotFoundError("deep-gemm"),
+            ):
+                self.assertEqual(
+                    self.warmup._sample_m_values(
+                        1003, 3072, 512, fp8=False, k_major=True, num_sms=152
+                    ),
+                    tuple(selector._dense_gemm_m_grid(1003)),
+                )
+
+    def test_existing_fp8_selector_literal_fixtures_are_unchanged(self):
+        selector = load_sampling()
+        expected = {
+            1: (1, 16, 128, 128, 1, 2, 8, 128, 16, 128, 128, 128, 128, 12, 1, 0),
+            127: (1, 64, 128, 128, 1, 2, 32, 128, 16, 128, 128, 128, 128, 10, 1, 0),
+            1003: (0, 128, 192, 128, 2, 1, 128, 96, 128, 192, 128, 128, 128, 6, 1, 0),
+            8191: (0, 128, 256, 128, 2, 1, 128, 128, 128, 256, 128, 128, 128, 5, 1, 0),
+        }
+        for rows, signature in expected.items():
+            self.assertEqual(
+                selector._sm100_dense_layout_signature(
+                    m_value=rows,
+                    n_value=7168,
+                    k_value=1536,
+                    kind="v41_fp8",
+                    num_sms=152,
+                ),
+                signature,
+            )
+        self.assertEqual(
+            selector._generate_dense_gemm_warmup_m_grid(
+                max_m=65536,
+                n_value=7168,
+                k_value=1536,
+                kind="v41_fp8",
+                num_sms=152,
+            ),
+            (
+                1,
+                33,
+                65,
+                97,
+                129,
+                257,
+                289,
+                321,
+                353,
+                385,
+                513,
+                1025,
+                1041,
+                1121,
+                1201,
+                1665,
+                2401,
+            ),
+        )
+        self.assertEqual(
+            selector._generate_dense_gemm_warmup_m_grid(
+                max_m=65536,
+                n_value=7168,
+                k_value=1536,
+                kind="fp8",
+                num_sms=152,
+            ),
+            (
+                1,
+                33,
+                65,
+                97,
+                129,
+                257,
+                289,
+                321,
+                353,
+                385,
+                513,
+                561,
+                1025,
+                1041,
+                1121,
+                1201,
+                1665,
+            ),
+        )
+
+    def test_supported_bf16_dispatch_passes_real_sms_and_verified_layout(self):
+        observed = {}
+        self._prepared_bf16_maximum(
+            "6.0",
+            "torch.bfloat16",
+            1048576,
+            1,
+            bf16_native=True,
+            sample_options=observed,
+        )
+        self.assertTrue(observed["k_major"])
+        self.assertEqual(observed["num_sms"], 152)
+
+    def test_bf16_dispatch_non_sm10_or_unverified_layout_uses_fallback(self):
+        for native, capability in ((False, 10), (True, 9)):
+            with self.subTest(native=native, capability=capability):
+                observed = {}
+                self._prepared_bf16_maximum(
+                    "6.0",
+                    "torch.bfloat16",
+                    1048576,
+                    1,
+                    bf16_native=native,
+                    capability=capability,
+                    sample_options=observed,
+                )
+                self.assertFalse(observed["k_major"])
 
     def test_collects_outer_wrappers_once_and_keeps_scale_layouts(self):
         first = CudaFp8GEMMLinear()
@@ -312,12 +535,23 @@ class BoundedProjectionWarmupTest(unittest.TestCase):
         )
 
     def _prepared_bf16_maximum(
-        self, budget, dtype, sequence, batch, *, supported=True, free=1 << 50, fp8=False
+        self,
+        budget,
+        dtype,
+        sequence,
+        batch,
+        *,
+        supported=True,
+        free=1 << 50,
+        fp8=False,
+        bf16_native=False,
+        capability=10,
+        sample_options=None,
     ):
         dependency = types.ModuleType(
             "rtp_llm.models_py.modules.dsv41.dsv4_kernel_jit_warmup"
         )
-        dependency._get_deep_gemm_num_sms = lambda *_: 148
+        dependency._get_deep_gemm_num_sms = lambda *_: 152
         dependency._release_cuda_cache = lambda *_: None
         dependency._run_deepgemm_warmup_launches_serialized = (
             lambda _, function: function()
@@ -356,7 +590,7 @@ class BoundedProjectionWarmupTest(unittest.TestCase):
             is_current_stream_capturing=lambda: False,
             synchronize=lambda *_: None,
             mem_get_info=lambda *_: (free, 1 << 50),
-            get_device_capability=lambda *_: (10, 3),
+            get_device_capability=lambda *_: (capability, 3),
         )
 
         def check_support(hidden, splits):
@@ -371,6 +605,12 @@ class BoundedProjectionWarmupTest(unittest.TestCase):
             ),
             supports_skip_head_mid=check_support,
         )
+        if bf16_native:
+            native = type("CudaF16Linear", (), {})()
+            native.weight = projection.weight
+            native.weight._stride = (1, native.weight.shape[0])
+            native.supports_skip_head_mid = check_support
+            projection = native
         if fp8:
             projection.N, projection.K = 3072, 512
         cache = SimpleNamespace(
@@ -384,6 +624,12 @@ class BoundedProjectionWarmupTest(unittest.TestCase):
             kv_cache=SimpleNamespace(get_layer_cache_groups=lambda _: [cache]),
         )
         seen = []
+
+        def record_sampling(maximum, *_args, **kwargs):
+            if sample_options is not None:
+                sample_options.update(kwargs)
+            return (maximum,)
+
         with (
             mock.patch.dict(
                 sys.modules, {m.__name__: m for m in (dependency, switch, torch, plan)}
@@ -401,7 +647,7 @@ class BoundedProjectionWarmupTest(unittest.TestCase):
             mock.patch.object(
                 self.warmup,
                 "_sample_m_values",
-                side_effect=lambda maximum, *_args, **_kwargs: (maximum,),
+                side_effect=record_sampling,
             ),
             mock.patch.object(
                 self.warmup,

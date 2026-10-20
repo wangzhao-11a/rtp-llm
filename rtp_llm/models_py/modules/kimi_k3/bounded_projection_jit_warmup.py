@@ -1,8 +1,8 @@
 """Bounded K3 projection/FLA preparation using loaded model geometry.
 
 DeepGEMM's heuristic-selected layouts still depend on M with compiled_dims=nk.
-Reuse DSV41's representative grid for matching FP8 layouts and DSV4's bounded
-sample grid for BF16. These samples do not establish exhaustive traffic coverage.
+Reuse DSV41's representative grid for matching FP8/DG98 BF16 layouts; retain
+DSV4's bounded BF16 grid. These samples do not establish exhaustive coverage.
 """
 
 from __future__ import annotations
@@ -171,6 +171,7 @@ def _fla_l2norm_specs(model, max_rows):
 
 
 def _sample_m_values(max_rows, n, k, *, fp8, k_major, num_sms):
+    """k_major selects verified FP8 K/K or BF16 K/MN operand dispatch."""
     from rtp_llm.models_py.modules.dsv41.dsv4_kernel_jit_warmup import (
         _dense_gemm_m_grid,
         _generate_dense_gemm_warmup_m_grid,
@@ -184,6 +185,30 @@ def _sample_m_values(max_rows, n, k, *, fp8, k_major, num_sms):
             kind="v41_fp8",
             num_sms=num_sms,
         )
+    if not fp8 and k_major:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            matching_dg = version("deep-gemm") == "2.8.2+98a672e.cu132"
+        except PackageNotFoundError:
+            matching_dg = False
+        if matching_dg:
+            # Advisory DG98 default block-multiple policy, not a proof of
+            # arbitrary runtime heuristic state or complete traffic closure.
+            logging.info(
+                "K3 DG98 BF16 K/MN advisory samples: default block multiples; "
+                "runtime overrides unverified, retaining DSV4 fallback grid"
+            )
+            representatives = _generate_dense_gemm_warmup_m_grid(
+                max_m=max_rows,
+                n_value=n,
+                k_value=k,
+                kind="dg98_bf16_k_mn",
+                num_sms=num_sms,
+            )
+            return tuple(
+                sorted(set(representatives) | set(_dense_gemm_m_grid(max_rows)))
+            )
     return tuple(_dense_gemm_m_grid(max_rows))
 
 
@@ -344,20 +369,32 @@ def warmup_kimi_k3_projection_jit(model, init_resource):
             kv_rows = _kv_up_rows(
                 model, init_resource, layer, projection, splits, max_rows
             )
+            bf16_k_mn = (
+                not fp8
+                and supported
+                and type(projection).__name__ == "CudaF16Linear"
+                and str(projection.weight.dtype) == "torch.bfloat16"
+                and projection.weight.stride(-2) == 1
+                and projection.weight.stride(-1) == n
+                and torch.cuda.get_device_capability(device)[0] == 10
+            )
             samples = _sample_m_values(
                 kv_rows,
                 n,
                 k,
                 fp8=fp8,
-                # Skip-head kernels use a distinct epilogue: retain DSV4's
-                # bounded endpoint grid, not an unproven ordinary-GEMM closure.
+                # BF16 weight.T is contiguous: DG receives A=K/B=MN.
+                # Other skip-head layouts retain the bounded fallback grid.
                 k_major=(
-                    fp8
-                    and not supported
-                    and projection.weight.stride(-1) == 1
-                    and torch.cuda.get_device_capability(device)[0] == 10
+                    bf16_k_mn
+                    or (
+                        fp8
+                        and not supported
+                        and projection.weight.stride(-1) == 1
+                        and torch.cuda.get_device_capability(device)[0] == 10
+                    )
                 ),
-                num_sms=_get_deep_gemm_num_sms(device) if fp8 else 1,
+                num_sms=_get_deep_gemm_num_sms(device) if fp8 or bf16_k_mn else 1,
             )
             packed_n = n // (splits[0] + splits[2]) * sum(splits) if supported else n
             started = time.perf_counter()

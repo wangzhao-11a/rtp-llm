@@ -397,19 +397,27 @@ class BoundedProjectionGpuTest(unittest.TestCase):
             probe = torch.zeros((1, k), device=self.device, dtype=torch.bfloat16)
             self.assertTrue(projection.supports_skip_head_mid(probe, splits))
             del probe
+            import deep_gemm
+
             samples = self.warmup._sample_m_values(
                 item["max_m"],
                 n,
                 k,
                 fp8=False,
-                k_major=False,
-                num_sms=1,
+                k_major=(
+                    projection.weight.T.is_contiguous()
+                    and torch.cuda.get_device_capability(self.device)[0] == 10
+                ),
+                num_sms=deep_gemm.get_num_sms(),
             )
             self.assertTrue(samples)
             probes = independent_probe_m_values(
                 item["max_m"],
                 self.manifest["geometry_provenance"]["kind"],
-                item.get("probe_m", ()),
+                (
+                    *item.get("probe_m", ()),
+                    *range(1, min(item["max_m"], 32768) + 1, 127),
+                ),
             )
             self.warmup._check_projection_memory(
                 self.device,
@@ -471,11 +479,6 @@ class BoundedProjectionGpuTest(unittest.TestCase):
                 del hidden, packed, expected, viewed
             torch.cuda.synchronize()
             observed = self.dg_keys()
-            self.assertEqual(
-                observed,
-                prepared,
-                f"unseen DG keys under independent BF16 probes: {sorted(observed - prepared)}",
-            )
             self.evidence["checks"].append(
                 {
                     "kind": "bf16_kv_up",
@@ -483,7 +486,14 @@ class BoundedProjectionGpuTest(unittest.TestCase):
                     "sampled_m": samples,
                     "independent_probe_m": probes,
                     "dg_keys": sorted(prepared),
+                    "observed_dg_keys": sorted(observed),
+                    "unseen_dg_keys": sorted(observed - prepared),
                 }
+            )
+            self.assertEqual(
+                observed,
+                prepared,
+                f"unseen DG keys under independent BF16 probes: {sorted(observed - prepared)}",
             )
             del projection, raw
             torch.cuda.empty_cache()
