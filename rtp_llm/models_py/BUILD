@@ -5,6 +5,7 @@ py_library(
     srcs = [
         "ascend/__init__.py",
         "ascend/linear_attention.py",
+        "ascend/linear_cache.py",
     ],
     data = ["//rtp_llm:__init__.py"],
     deps = [
