@@ -3352,9 +3352,30 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     }
 
     torch::Tensor pre_target_token_t;
-    // Prefer device state published before the bookkeeping worker launches.
-    // Batch gather: pre_target_token[i] = accept_tokens[i, accept_len[i]-1]
+    // decodeStep has waited for previous bookkeeping and its CUDA writes.
+    // Reuse the published target instead of gathering it again from accepted tokens.
     {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(pre_target_sp_buffer_gather)");
+        std::vector<torch::Tensor> pre_target_slices_gpu;
+        pre_target_slices_gpu.reserve(batch_size);
+        bool all_sp_buffer_gpu = !all_streams.empty();
+        for (const auto& stream : all_streams) {
+            auto sp_output_buffer = stream->getSPOutputBuffer();
+            if (!sp_output_buffer || !sp_output_buffer->target_token_gpu.defined()
+                || !sp_output_buffer->target_token_gpu.is_cuda()
+                || sp_output_buffer->target_token_gpu.numel() != 1) {
+                all_sp_buffer_gpu = false;
+                break;
+            }
+            pre_target_slices_gpu.push_back(sp_output_buffer->target_token_gpu.reshape({-1}));
+        }
+        if (all_sp_buffer_gpu && pre_target_slices_gpu.size() == batch_size && !pre_target_slices_gpu.empty()) {
+            pre_target_token_t = torch::cat(pre_target_slices_gpu, 0).to(torch::kInt32);
+        }
+    }
+
+    // Fall back to accepted-token state when a mirror is unavailable.
+    if (!pre_target_token_t.defined()) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(pre_target_device_gather)");
         bool all_device_state = !all_streams.empty();
         if (all_device_state) {
@@ -3386,25 +3407,6 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         if (!all_device_state && all_streams.empty()) {
             pre_target_token_t =
                 torch::empty({(int64_t)batch_size}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-        }
-    }
-
-    if (!pre_target_token_t.defined()) {
-        RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(pre_target_sp_buffer_gather)");
-        std::vector<torch::Tensor> pre_target_slices_gpu;
-        pre_target_slices_gpu.reserve(batch_size);
-        bool all_sp_buffer_gpu = !all_streams.empty();
-        for (const auto& stream : all_streams) {
-            auto sp_output_buffer = stream->getSPOutputBuffer();
-            if (!sp_output_buffer || !sp_output_buffer->target_token_gpu.defined()
-                || !sp_output_buffer->target_token_gpu.is_cuda()) {
-                all_sp_buffer_gpu = false;
-                break;
-            }
-            pre_target_slices_gpu.push_back(sp_output_buffer->target_token_gpu.reshape({-1}));
-        }
-        if (all_sp_buffer_gpu && pre_target_slices_gpu.size() == batch_size && !pre_target_slices_gpu.empty()) {
-            pre_target_token_t = torch::cat(pre_target_slices_gpu, 0).to(torch::kInt32);
         }
     }
 
@@ -3755,6 +3757,11 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         draft_probs_all = draft_all_probs_full.clone();
     }
 
+    // Reuse the batched accept_len - 1 indices. Materialize target tokens only
+    // when a stream needs the SP mirror; every stream keeps a view of this
+    // owned result instead of launching its own sub/cast/index_select kernels.
+    torch::Tensor target_tokens_all;
+
     // 4. Assign per-stream views (narrow is metadata-only, no kernel launch)
     int64_t probs_batch_off = 0;
     int64_t idx             = 0;
@@ -3781,9 +3788,12 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         // and publish equivalent per-stream views here.
         auto sp_output_buffer = stream->getSPOutputBuffer();
         if (sp_output_buffer) {
-            auto target_idx = (state.accept_len_gpu - 1).to(torch::kLong);
-            sp_output_buffer->target_token_gpu =
-                state.accept_tokens_gpu.squeeze(0).index_select(/*dim=*/0, target_idx).to(torch::kInt32);
+            if (!target_tokens_all.defined()) {
+                target_tokens_all = accept_tokens_gpu_all.gather(1, hidden_idx_all.reshape({batch_size, 1}))
+                                        .reshape({batch_size})
+                                        .to(torch::kInt32);
+            }
+            sp_output_buffer->target_token_gpu = target_tokens_all.narrow(0, idx, 1);
             sp_output_buffer->propose_tokens_gpu = state.propose_tokens_gpu;
         }
         stream->setMtpAsyncDeviceState(std::move(state));

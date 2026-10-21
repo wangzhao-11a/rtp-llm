@@ -97,6 +97,17 @@ __global__ void mtpSpecDecodeTokensMetadataPrepareKernel(const int32_t* __restri
     }
 }
 
+// Last accepted row in each dense speculative block; replaces arange/sub/add.
+__global__ void mtpAcceptedTokenIndexesKernel(const int32_t* __restrict__ accept_len,
+                                             int32_t* __restrict__ lm_output_indexes,
+                                             int32_t tokens_per_batch,
+                                             int64_t batch_size) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        lm_output_indexes[idx] = static_cast<int32_t>(idx * tokens_per_batch + accept_len[idx] - 1);
+    }
+}
+
 __global__ void mtpPrefillShiftAppendKernel(const int32_t* __restrict__ combo_tokens_in,
                                             const int32_t* __restrict__ input_lengths,
                                             const int32_t* __restrict__ batch_offsets,
@@ -241,6 +252,27 @@ void invokeMtpSpecDecodeTokensMetadataPrepare(const std::vector<torch::Tensor>& 
         lm_output_indexes.data_ptr<int32_t>(),
         tokens_per_batch,
         static_cast<int32_t>(batch_size));
+}
+
+void invokeMtpAcceptedTokenIndexes(const torch::Tensor& accept_len,
+                                    torch::Tensor&       lm_output_indexes,
+                                    int32_t              tokens_per_batch,
+                                    cudaStream_t         stream) {
+    const int64_t batch_size = lm_output_indexes.numel();
+    checkCudaI32Vector(accept_len, "accept_len", batch_size);
+    checkCudaI32Vector(lm_output_indexes, "lm_output_indexes", batch_size);
+    RTP_LLM_CHECK_WITH_INFO(accept_len.device() == lm_output_indexes.device(),
+                            "accept_len and lm_output_indexes must be on the same device");
+    RTP_LLM_CHECK_WITH_INFO(tokens_per_batch > 0, "tokens_per_batch must be positive");
+    if (batch_size == 0) {
+        return;
+    }
+    constexpr int block_size = 256;
+    const int grid_size = static_cast<int>((batch_size + block_size - 1) / block_size);
+    mtpAcceptedTokenIndexesKernel<<<grid_size, block_size, 0, stream>>>(accept_len.data_ptr<int32_t>(),
+                                                                       lm_output_indexes.data_ptr<int32_t>(),
+                                                                       tokens_per_batch,
+                                                                       batch_size);
 }
 
 // Fused kernel: next_seq_len[i] = prev_seq_len[i] + accept_len[i]

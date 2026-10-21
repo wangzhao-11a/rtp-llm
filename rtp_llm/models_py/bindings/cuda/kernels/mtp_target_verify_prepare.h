@@ -26,6 +26,12 @@ void invokeMtpSpecDecodeTokensMetadataPrepare(const std::vector<torch::Tensor>& 
                                               int32_t                           tokens_per_batch,
                                               cudaStream_t                      stream);
 
+// Selects the last accepted row from each dense speculative-token block.
+void invokeMtpAcceptedTokenIndexes(const torch::Tensor& accept_len,
+                                    torch::Tensor&       lm_output_indexes,
+                                    int32_t              tokens_per_batch,
+                                    cudaStream_t         stream);
+
 // Fused kernel for dispatchDecodeAsync per-stream state publishing.
 // Computes: next_seq_len[i] = prev_seq_len[i] + accept_len[i]  (int32)
 //           hidden_idx[i]   = accept_len[i] - 1                 (int64)

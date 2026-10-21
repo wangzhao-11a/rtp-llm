@@ -993,10 +993,23 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
     model_input.combo_tokens =
         toCudaInt32(speculative_sampler_output.accept_tokens.reshape({(int64_t)total_tokens}), host_holder);
     auto accept_len_d = toCudaInt32(speculative_sampler_output.accept_len, host_holder);
-    model_input.lm_output_indexes =
-        torch::arange(
-            0, total_tokens, propose_step_ + 1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))
-        + (accept_len_d - 1);
+#if USING_CUDA
+    if (accept_len_d.dim() == 1 && accept_len_d.numel() == static_cast<int64_t>(batch_size)
+        && accept_len_d.is_contiguous()) {
+        // Fuse three integer-only launches between rejection sampling and draft prefill.
+        model_input.lm_output_indexes = torch::empty({static_cast<int64_t>(batch_size)}, accept_len_d.options());
+        invokeMtpAcceptedTokenIndexes(accept_len_d,
+                                      model_input.lm_output_indexes,
+                                      static_cast<int32_t>(propose_step_ + 1),
+                                      cuda_graph::graphGetCurrentStream().stream());
+    } else
+#endif
+    {
+        model_input.lm_output_indexes =
+            torch::arange(
+                0, total_tokens, propose_step_ + 1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))
+            + (accept_len_d - 1);
+    }
     model_input.last_hidden_states = model_output.all_hidden_states;
     hidden_states_d_t              = model_input.last_hidden_states;
 }

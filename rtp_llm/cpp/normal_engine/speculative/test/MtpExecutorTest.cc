@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <memory>
 #include <chrono>
+#include <iostream>
 #include "torch/all.h"
 #include "autil/EnvUtil.h"
 #include "gtest/gtest.h"
@@ -1775,6 +1776,123 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
     checkOutput(stream2, {3, 2, 1, 3, 0, 2, 2, 1}, {1, 2}, {0.0, 1.0, 0.0, 0.0}, {1.5, 1.55});
 }
 
+TEST_F(MtpExecutorTest, testDraftTargetTokenMirrorAndFallbacks) {
+    MtpExecutorTestConfig config;
+    config.gen_num_per_cycle = 1;  // Exercise input assembly without a model forward.
+    auto components = createMtpExecutorComponents(config);
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    for (int mode = 0; mode < 6; ++mode) {
+        SCOPED_TRACE(::testing::Message() << "mode=" << mode);
+        std::list<GenerateStreamPtr> streams;
+        for (int32_t target : {10, 20, 30}) {
+            auto stream = createContextStream(
+                components.model_config, components.runtime_config, components.resource_context, {1, 2});
+            stream->setIsContextStream(false);
+            auto output = std::make_shared<SpeculativeExecutorStreamOutput>();
+            output->tokens = torch::tensor({target, target + 1}, torch::kInt32).reshape({1, 2});
+            if (mode != 3 && !(mode == 1 && target == 20)) {
+                output->target_token_gpu = torch::tensor({target}, cuda_i32);
+                if (mode == 4) {
+                    output->target_token_gpu = output->target_token_gpu.to(torch::kInt64);
+                } else if (mode == 5 && target == 20) {
+                    // An invalid mirror must not override valid accepted-token state.
+                    output->target_token_gpu = torch::tensor({target, target + 1}, cuda_i32);
+                }
+            }
+            stream->setSPOutputBuffer(output);
+            if (mode != 2 && mode != 3) {
+                GenerateStream::MtpAsyncDeviceState state;
+                state.accept_len_gpu = torch::tensor({2}, cuda_i32);
+                state.accept_tokens_gpu = torch::tensor({target - 1, target}, cuda_i32).reshape({1, 2});
+                stream->setMtpAsyncDeviceState(std::move(state));
+            }
+            streams.push_front(stream);  // The batch order can differ from the publish order.
+        }
+        StreamGroups groups(streams);
+        GptModelInputs input;
+        input.combo_tokens = torch::tensor({31, 21, 11}, cuda_i32);
+        input.prefix_lengths = torch::full({3}, 2, cuda_i32);
+        input.sequence_lengths = torch::full({3}, 3, cuda_i32);
+        std::vector<torch::Tensor> draft_probs;
+        torch::Tensor draft_tokens;
+        int64_t forward_us = 0;
+        components.executor->draftModelDecode(input, groups, draft_probs, draft_tokens, forward_us);
+        const auto expected = torch::tensor({30, 31, 20, 21, 10, 11}, torch::kInt32).reshape({3, 2});
+        EXPECT_TRUE(torch::equal(draft_tokens.cpu(), expected));
+        EXPECT_TRUE(torch::equal(input.combo_tokens.cpu(), expected.reshape({-1})));
+        EXPECT_EQ(forward_us, 0);
+    }
+}
+
+TEST_F(MtpExecutorTest, testAsyncDispatchTargetTokensKeepOwnedStorage) {
+    MtpExecutorTestConfig config;
+    config.gen_num_per_cycle = 3;
+    config.vocab_size = 1024;
+    config.vocab_size_override = 1024;
+    auto components = createMtpExecutorComponents(config);
+    components.model_config.vocab_size = 1024;  // Streams use a separate fixture config.
+    const int64_t width = config.gen_num_per_cycle + 1;
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+
+    for (const int64_t batch_size : {1, 6, 32}) {
+        for (const auto token_dtype : {torch::kInt32, torch::kInt64}) {
+            SCOPED_TRACE(::testing::Message() << "batch=" << batch_size << ", dtype=" << token_dtype);
+            std::list<GenerateStreamPtr> streams;
+            for (int64_t i = 0; i < batch_size; ++i) {
+                auto stream = createContextStream(
+                    components.model_config, components.runtime_config, components.resource_context, {1, 2});
+                stream->setIsContextStream(false);
+                auto output = std::make_shared<SpeculativeExecutorStreamOutput>();
+                output->tokens = torch::full({1, 2}, -1, torch::kInt32);
+                stream->setSPOutputBuffer(output);
+                streams.push_back(stream);
+            }
+            StreamGroups groups(streams);
+            const auto all_streams = groups.allStreams();
+            const std::vector<GenerateStreamPtr> ordered(all_streams.begin(), all_streams.end());
+            speculative::SpeculativeSamplerOutput accepted;
+            accepted.accept_len_cpu = torch::remainder(torch::arange(batch_size, torch::kInt32), width) + 1;
+            accepted.accept_tokens_cpu = torch::arange(1, batch_size * width + 1, torch::kInt32)
+                                             .reshape({batch_size, width});
+            accepted.accept_len = accepted.accept_len_cpu.to(torch::kCUDA);
+            accepted.accept_tokens = accepted.accept_tokens_cpu.to(cuda_i32.dtype(token_dtype));
+            accepted.transfer_done_event->record(cuda_graph::graphGetCurrentStream());
+            MergedOutput draft;
+            draft.sampler_output.token_ids = torch::ones({batch_size, 1}, cuda_i32);
+            draft.sampler_output.all_probs = torch::zeros({batch_size, 1024}, cuda_i32.dtype(torch::kFloat32));
+            draft.model_output.all_hidden_states =
+                torch::arange(batch_size * width * 2, cuda_i32.dtype(torch::kFloat32))
+                    .reshape({batch_size * width, 2});
+            auto ready = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+            ready->record(cuda_graph::graphGetCurrentStream());
+            std::vector<torch::Tensor> published_tokens;
+            {
+                // Hold the first stream's update lock so the worker cannot overwrite
+                // the main-thread mirrors before we retain their views.
+                std::unique_lock<std::mutex> update_lock(*ordered.front()->mutex_);
+                const auto status = components.executor->dispatchDecodeAsync(groups, accepted, {}, draft, ready, ready);
+                EXPECT_TRUE(status.ok());
+                for (const auto& stream : ordered) {
+                    published_tokens.push_back(stream->getSPOutputBuffer()->target_token_gpu);
+                }
+            }
+            components.executor->spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+            // Simulate reuse of the sampler's source allocation. Published mirrors
+            // must retain their values, including after the original handle is dropped.
+            accepted.accept_tokens.fill_(-1);
+            accepted.accept_tokens = torch::Tensor();
+            for (int64_t i = 0; i < batch_size; ++i) {
+                const int32_t count = static_cast<int32_t>(i % width + 1);
+                ASSERT_EQ(published_tokens[i].scalar_type(), torch::kInt32);
+                ASSERT_EQ(published_tokens[i].numel(), 1);
+                EXPECT_EQ(published_tokens[i].item<int32_t>(), i * width + count);
+                EXPECT_EQ(ordered[i]->seqLength(), 2 + count);
+                EXPECT_FALSE(ordered[i]->hasPendingAsyncBookkeeping());
+            }
+        }
+    }
+}
+
 TEST_F(MtpExecutorTest, testDispatchStatePrepareKernel) {
     // Test invokeMtpDispatchStatePrepare correctness
     const int64_t batch_size = 8;
@@ -1865,5 +1983,91 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareBenchmark) {
     RTP_LLM_LOG_INFO("[dispatch-bench] scalar:  %ld us total, %.2f us/iter", us_scalar, (double)us_scalar / iterations);
     RTP_LLM_LOG_INFO("[dispatch-bench] speedup: %.1fx", speedup);
 }
+
+#if USING_CUDA
+TEST_F(MtpExecutorTest, DISABLED_benchmarkAcceptedTokenIndexes) {
+    // Expression-level benchmark only: no model forward or end-to-end TPOT claim.
+    // Both paths include the actual output allocations and use the same CUDA stream.
+    constexpr int warmup = 10;
+    constexpr int iterations = 50;
+    constexpr int samples = 7;
+    const auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaEvent_t begin_event;
+    cudaEvent_t end_event;
+    ASSERT_EQ(cudaEventCreate(&begin_event), cudaSuccess);
+    ASSERT_EQ(cudaEventCreate(&end_event), cudaSuccess);
+
+    for (const int step : {3, 5}) {
+        const int width = step + 1;
+        for (const int64_t batch_size : {1, 6, 32, 128}) {
+            std::vector<int32_t> lengths(batch_size);
+            for (int64_t i = 0; i < batch_size; ++i) {
+                lengths[i] = static_cast<int32_t>(i % width + 1);
+            }
+            const auto accept_len = torch::tensor(lengths, torch::kInt32).to(torch::kCUDA);
+            auto old_expression = [&]() {
+                return torch::arange(0, batch_size * width, width, options) + (accept_len - 1);
+            };
+            auto new_expression = [&]() {
+                auto output = torch::empty({batch_size}, options);
+                invokeMtpAcceptedTokenIndexes(accept_len, output, width, stream);
+                return output;
+            };
+            ASSERT_TRUE(torch::equal(old_expression(), new_expression()));
+            torch::Tensor retained_output;
+            for (int i = 0; i < warmup; ++i) {
+                retained_output = old_expression();
+                retained_output = new_expression();
+            }
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+            std::vector<double> old_enqueue, old_complete, old_device;
+            std::vector<double> new_enqueue, new_complete, new_device;
+            auto measure = [&](const auto& expression,
+                               std::vector<double>& enqueue,
+                               std::vector<double>& complete,
+                               std::vector<double>& device) {
+                ASSERT_EQ(cudaEventRecord(begin_event, stream), cudaSuccess);
+                const auto start = std::chrono::steady_clock::now();
+                for (int i = 0; i < iterations; ++i) {
+                    retained_output = expression();
+                }
+                const auto submitted = std::chrono::steady_clock::now();
+                ASSERT_EQ(cudaEventRecord(end_event, stream), cudaSuccess);
+                ASSERT_EQ(cudaEventSynchronize(end_event), cudaSuccess);
+                const auto completed = std::chrono::steady_clock::now();
+                float elapsed_ms = 0.0f;
+                ASSERT_EQ(cudaEventElapsedTime(&elapsed_ms, begin_event, end_event), cudaSuccess);
+                enqueue.push_back(std::chrono::duration<double, std::micro>(submitted - start).count() / iterations);
+                complete.push_back(std::chrono::duration<double, std::micro>(completed - start).count() / iterations);
+                // CUDA events include gaps between host submissions; this is not pure kernel time.
+                device.push_back(static_cast<double>(elapsed_ms) * 1000.0 / iterations);
+            };
+            for (int sample = 0; sample < samples; ++sample) {
+                if (sample % 2 == 0) {
+                    measure(old_expression, old_enqueue, old_complete, old_device);
+                    measure(new_expression, new_enqueue, new_complete, new_device);
+                } else {
+                    measure(new_expression, new_enqueue, new_complete, new_device);
+                    measure(old_expression, old_enqueue, old_complete, old_device);
+                }
+            }
+            auto median = [](std::vector<double> values) {
+                std::sort(values.begin(), values.end());
+                return values.at(values.size() / 2);
+            };
+            std::cout << "[mtp-accepted-token-indexes-bench] batch=" << batch_size << " step=" << step
+                      << " iterations=" << iterations << " samples=" << samples
+                      << " old_enqueue_us=" << median(old_enqueue) << " new_enqueue_us=" << median(new_enqueue)
+                      << " old_complete_us=" << median(old_complete) << " new_complete_us=" << median(new_complete)
+                      << " old_cuda_event_us=" << median(old_device) << " new_cuda_event_us=" << median(new_device)
+                      << std::endl;
+        }
+    }
+    EXPECT_EQ(cudaEventDestroy(begin_event), cudaSuccess);
+    EXPECT_EQ(cudaEventDestroy(end_event), cudaSuccess);
+}
+#endif
 
 }  // namespace rtp_llm

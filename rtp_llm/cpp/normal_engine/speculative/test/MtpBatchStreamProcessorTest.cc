@@ -1648,6 +1648,61 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInput) {
     EXPECT_EQ(expect_last_hidden_states, toVec<float>(last_hidden_states));
 }
 
+TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInputBatchShapes) {
+    ModelConfig model_config;
+    model_config.max_seq_len = 2048;
+    model_config.vocab_size = 4;
+    model_config.num_layers = 1;
+    PDSepConfig pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig cache_config;
+    cache_config.group_types = {CacheGroupType::FULL};
+
+    for (const int propose_step : {1, 3, 5, 8}) {
+        SpeculativeExecutionConfig sp_config;
+        sp_config.gen_num_per_cycle = propose_step;
+        MtpBatchStreamProcessor processor(
+            model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+        const int width = propose_step + 1;
+        for (const int64_t batch_size : {0, 1, 6, 32, 257}) {
+            for (const bool strided : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "step=" << propose_step << ", batch=" << batch_size
+                                                  << ", strided=" << strided);
+                std::vector<int32_t> lengths(batch_size);
+                std::vector<int32_t> expected_indexes(batch_size);
+                for (int64_t i = 0; i < batch_size; ++i) {
+                    lengths[i] = static_cast<int32_t>(i % width + 1);
+                    expected_indexes[i] = static_cast<int32_t>(i * width + lengths[i] - 1);
+                }
+                auto lengths_cpu = torch::tensor(lengths, torch::kInt32);
+                speculative::SpeculativeSamplerOutput output;
+                output.accept_len = lengths_cpu.to(torch::kCUDA);
+                if (strided) {
+                    auto padded = torch::empty({batch_size, 2}, output.accept_len.options());
+                    padded.select(1, 0).copy_(output.accept_len);
+                    output.accept_len = padded.select(1, 0);
+                }
+                output.accept_tokens = torch::arange(batch_size * width, output.accept_len.options())
+                                           .reshape({batch_size, width});
+                GptModelInputs input;
+                GptModelOutputs model_output;
+                model_output.all_hidden_states = torch::empty({batch_size * width, 2}, torch::kFloat32);
+                torch::Tensor hidden;
+                TensorHolder holder;
+                processor.updateDecodePostDraftModelInput(input, model_output, output, batch_size, hidden, holder);
+
+                EXPECT_TRUE(input.lm_output_indexes.is_cuda());
+                EXPECT_EQ(input.lm_output_indexes.scalar_type(), torch::kInt32);
+                EXPECT_EQ(input.lm_output_indexes.dim(), 1);
+                EXPECT_EQ(expected_indexes, toVec<int32_t>(input.lm_output_indexes));
+                EXPECT_TRUE(torch::equal(input.combo_tokens, output.accept_tokens.reshape({batch_size * width})));
+                EXPECT_EQ(lengths, toVec<int32_t>(output.accept_len));
+                EXPECT_EQ(hidden.data_ptr(), model_output.all_hidden_states.data_ptr());
+            }
+        }
+    }
+}
+
 TEST_F(MtpBatchStreamProcessorTest, testUpdateOneStepDraftSamplerOutput) {
     ModelConfig                 model_config;
     RuntimeConfig               runtime_config;

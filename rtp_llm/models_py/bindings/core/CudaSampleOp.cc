@@ -59,11 +59,11 @@ std::pair<torch::Tensor, torch::Tensor> makeSamplingSeedOffsetTensors(const std:
                                                                       int64_t                           batch_size,
                                                                       int                               increment,
                                                                       TensorHolder*                     buffer_holder) {
-    auto options  = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
-    auto seed_h   = torch::empty({batch_size}, options);
-    auto offset_h = torch::empty({batch_size}, options);
-    auto seed_ptr = seed_h.data_ptr<int64_t>();
-    auto off_ptr  = offset_h.data_ptr<int64_t>();
+    auto options       = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
+    // Keep both arrays in one allocation/H2D while preserving per-row RNG advancement.
+    auto seed_offset_h = torch::empty({2, batch_size}, options);
+    auto seed_ptr      = seed_offset_h.data_ptr<int64_t>();
+    auto off_ptr       = seed_ptr + batch_size;
 
     for (int64_t i = 0; i < batch_size; ++i) {
         auto generator = (i < static_cast<int64_t>(generators.size()) && generators[i].defined()) ?
@@ -74,13 +74,11 @@ std::pair<torch::Tensor, torch::Tensor> makeSamplingSeedOffsetTensors(const std:
         off_ptr[i]          = static_cast<int64_t>(offset);
     }
 
-    auto seed_d   = seed_h.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
-    auto offset_d = offset_h.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
+    auto seed_offset_d = seed_offset_h.to(torch::kCUDA, /*non_blocking=*/true);
     if (buffer_holder != nullptr) {
-        buffer_holder->hold_host(seed_h);
-        buffer_holder->hold_host(offset_h);
+        buffer_holder->hold_host(seed_offset_h);
     }
-    return {seed_d, offset_d};
+    return {seed_offset_d.select(0, 0), seed_offset_d.select(0, 1)};
 }
 
 void processLogits(const GreedyParams&  params,
@@ -302,9 +300,14 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
         cum_log_probs_t.add_(token_probs_t_log.to(cum_log_probs_t.device()));
     }
 
-    // Copy results back: transpose and copy to token_ids
-    auto transposed_t = transposed_tokens.transpose(0, 1).contiguous();
-    params.token_ids.copy_(transposed_t, true);
+    if (params.token_ids.is_cuda()) {
+        // Sampling only changes the final column; leave the full history in place.
+        params.token_ids.select(1, params.token_ids.size(1) - 1).copy_(samples_t.squeeze(0), true);
+    } else {
+        // Preserve the CPU path: a strided last-column D2H costs more for short histories.
+        auto transposed_t = transposed_tokens.transpose(0, 1).contiguous();
+        params.token_ids.copy_(transposed_t, true);
+    }
     check_cuda_error();
     return {success};
 }
@@ -348,8 +351,14 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         torch::Tensor selected_tokens = torch::argmax(probs_t, -1, /*keepdim=*/false);
         samples_t.copy_(selected_tokens, true);
 
-        auto output_tokens = transposed_tokens.transpose(0, 1).contiguous();
-        params.token_ids.copy_(output_tokens, true);
+        if (params.token_ids.is_cuda()) {
+            // The history is unchanged, including when the transpose aliases token_ids.
+            params.token_ids.select(1, params.token_ids.size(1) - 1).copy_(samples_t, true);
+        } else {
+            // Keep contiguous D2H for CPU callers, as in the general sampling path.
+            auto output_tokens = transposed_tokens.transpose(0, 1).contiguous();
+            params.token_ids.copy_(output_tokens, true);
+        }
 
         return GreedyOutput{};
     }
