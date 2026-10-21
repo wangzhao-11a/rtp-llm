@@ -251,6 +251,22 @@ def _get_python_import_lib_name(repository_ctx, python_bin):
   return result.stdout.splitlines()[0]
 
 
+def _get_python_shared_library(repository_ctx, python_bin):
+  """Resolve the shared library belonging to the selected interpreter."""
+  result = _execute(
+      repository_ctx,
+      [python_bin, "-c",
+       'import os, sysconfig;' +
+       'name = sysconfig.get_config_var("LDLIBRARY");' +
+       'directory = sysconfig.get_config_var("LIBDIR");' +
+       'assert name and directory, "Python shared-library metadata is unavailable";' +
+       'path = os.path.join(directory, name);' +
+       'assert os.path.isfile(path), "Configured Python shared library does not exist: " + path;' +
+       'print(path)'],
+      error_msg="Cannot resolve the selected Python shared library.")
+  return result.stdout.strip()
+
+
 def _create_local_python_repository(repository_ctx):
   """Creates the repository containing files set up to build with Python."""
   python_bin = _get_python_bin(repository_ctx)
@@ -267,6 +283,12 @@ def _create_local_python_repository(repository_ctx):
     python_include = _norm_path(python_include)
     python_import_lib_name = _get_python_import_lib_name(repository_ctx, python_bin)
     python_import_lib_src = python_include.rsplit('/', 1)[0] + "/libs/" + python_import_lib_name
+    python_import_lib_genrule = _symlink_genrule_for_dir(
+      repository_ctx, None, '', 'python_import_lib',
+      [python_import_lib_src], [python_import_lib_name])
+  else:
+    python_import_lib_src = _get_python_shared_library(repository_ctx, python_bin)
+    python_import_lib_name = python_import_lib_src.rsplit('/', 1)[-1]
     python_import_lib_genrule = _symlink_genrule_for_dir(
       repository_ctx, None, '', 'python_import_lib',
       [python_import_lib_src], [python_import_lib_name])
