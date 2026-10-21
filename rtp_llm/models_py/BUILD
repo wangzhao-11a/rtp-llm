@@ -1,6 +1,20 @@
 load("@arch_config//:arch_select.bzl", "requirement")
 
 py_library(
+    name = "ascend_linear_reference",
+    srcs = [
+        "ascend/__init__.py",
+        "ascend/linear_attention.py",
+    ],
+    data = ["//rtp_llm:__init__.py"],
+    deps = [
+        "//rtp_llm:torch",
+        "//rtp_llm:transformers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "utils",
     srcs = glob([
         "utils/*.py",
