@@ -281,20 +281,12 @@ def _reuse_query_variant_count(profile: bool = True) -> int:
     return max(1, warmup_runs + measure_runs + profile_runs)
 
 
-def main() -> str:
-    from rtp_llm.config.log_config import setup_logging
-
-    setup_logging()
-
-    args, remaining = parse_args()
-    remaining = resolve_perf_engine_paths(remaining)
-    generate_config = json.loads(args.generate_config)
-    os.makedirs(args.result_dir, exist_ok=True)
-    EngineServer.propagate_engine_env(remaining)
-
-    logging.info(f"Result directory: {args.result_dir}")
-    logging.info(f"Engine args forwarded to server: {remaining}")
-
+def _run_tests(
+    args: argparse.Namespace,
+    remaining: List[str],
+    generate_config: Dict[str, Any],
+    server: EngineServer,
+) -> None:
     distribution_mode = (
         args.dataset_name or args.dataset_path or args.dataset or args.test_json
     )
@@ -323,7 +315,6 @@ def main() -> str:
         needed_seq_len = max(all_seq_lens) + args.decode_test_length
         effective_max_seq_len = max(needed_seq_len, args.max_seq_len)
 
-        server = EngineServer(args, remaining)
         server.start(
             max_seq_len=effective_max_seq_len,
             max_concurrency=max(int(k) for k in batch_seq_len_map),
@@ -339,8 +330,6 @@ def main() -> str:
             decode_test_length=args.decode_test_length,
             generate_config=generate_config,
         ).run()
-        _collect_timeline_files(args.result_dir)
-        server.stop()
     else:
         batch_size_list = [int(x) for x in args.batch_size.split(",")]
         input_len_list = [int(x) for x in args.input_len.split(",")]
@@ -349,7 +338,6 @@ def main() -> str:
             batch_size_list = sorted({batch_size for batch_size, _ in grid_cases})
             input_len_list = sorted({input_len for _, input_len in grid_cases})
 
-        server = EngineServer(args, remaining)
         server.start(
             max_seq_len=_effective_grid_max_seq_len(args, input_len_list),
             max_concurrency=max(batch_size_list),
@@ -406,10 +394,35 @@ def main() -> str:
                 grid_cases=grid_cases,
                 reuse_cache_query_dict=reuse_cache_query_dict,
             ).run()
-        _collect_timeline_files(args.result_dir)
-        server.stop()
 
-    _write_test_info(args, remaining)
+
+def main() -> str:
+    from rtp_llm.config.log_config import setup_logging
+
+    setup_logging()
+
+    args, remaining = parse_args()
+    remaining = resolve_perf_engine_paths(remaining)
+    generate_config = json.loads(args.generate_config)
+    os.makedirs(args.result_dir, exist_ok=True)
+    EngineServer.propagate_engine_env(remaining)
+
+    logging.info(f"Result directory: {args.result_dir}")
+    logging.info(f"Engine args forwarded to server: {remaining}")
+
+    server = EngineServer(args, remaining)
+    try:
+        _run_tests(args, remaining, generate_config, server)
+    finally:
+        # A strict request failure must still preserve diagnostic artifacts and
+        # reclaim the server rather than leave the GPUs occupied until timeout.
+        try:
+            _collect_timeline_files(args.result_dir)
+        finally:
+            try:
+                server.stop()
+            finally:
+                _write_test_info(args, remaining)
     return args.result_dir
 
 

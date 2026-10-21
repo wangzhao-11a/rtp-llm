@@ -236,6 +236,27 @@ class BatchPerfImpl(object):
             f"tolerance={tolerance:.2f}, trace={self.profile_trace_name}",
         )
 
+    def _validate_request_success(
+        self, metric: TestResultMetrics, phase: str, run_index: int
+    ) -> None:
+        if os.environ.get("PERF_REQUIRE_ALL_REQUESTS_SUCCESS", "0") != "1":
+            return
+        if (
+            metric.total_requests == self.batch_size
+            and metric.success_requests == self.batch_size
+        ):
+            return
+        # Failed requests are otherwise represented by zero-valued metrics,
+        # allowing a Bazel perf test to report PASS without any inference.
+        message = (
+            f"PERF_REQUEST_FAILURE: phase={phase} run={run_index} "
+            f"trace={self.profile_trace_name!r} "
+            f"success={metric.success_requests}/{metric.total_requests} "
+            f"expected={self.batch_size}"
+        )
+        logging.error("%s metrics=%s", message, json.dumps(vars(metric)))
+        raise RuntimeError(message)
+
     def _prearm_profile(self) -> None:
         # Pre-arm via /start_profile with enable_all_rank=true so that all
         # TP/DP ranks profile the upcoming request. Controlled by env
@@ -277,7 +298,8 @@ class BatchPerfImpl(object):
                 self.warmup_runs,
                 self.profile_trace_name,
             )
-            _ = self._curl_server(input_queries=self._next_input_queries())
+            metric = self._curl_server(input_queries=self._next_input_queries())
+            self._validate_request_success(metric, "warmup", i + 1)
 
         all_measure_responses: List[ResponseInfo] = []
         for i in range(self.measure_runs):
@@ -302,6 +324,7 @@ class BatchPerfImpl(object):
                 metric.avg_reuse_len,
                 metric.avg_reuse_hit_rate,
             )
+            self._validate_request_success(metric, "measure", i + 1)
             all_measure_responses.extend(responses)
         results = analyze_results(all_measure_responses)
         self._validate_reuse_metric(results)
@@ -316,10 +339,11 @@ class BatchPerfImpl(object):
                     self.profile_runs,
                     self.profile_trace_name,
                 )
-                _ = self._curl_server(
+                metric = self._curl_server(
                     True,
                     input_queries=self._next_input_queries(),
                 )
+                self._validate_request_success(metric, "profile", i + 1)
             time.sleep(int(os.environ.get("PERF_PROFILE_FLUSH_SLEEP", "60")))
         return results
 

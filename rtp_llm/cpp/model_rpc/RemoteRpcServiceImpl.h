@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include <memory>
 #include "grpc++/grpc++.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServiceImpl.h"
@@ -11,8 +12,8 @@ class RemoteRpcServiceImpl: public LocalRpcServiceImpl {
 public:
     RemoteRpcServiceImpl() {}
     ~RemoteRpcServiceImpl() {}
-    void setDeferServiceStart(bool defer) override;
-    void startDeferredServices() override;
+    void         setDeferServiceStart(bool defer) override;
+    void         startDeferredServices() override;
     grpc::Status init(const EngineInitParams&                                maga_init_params,
                       py::object                                             mm_process_engine,
                       std::unique_ptr<rtp_llm::ProposeModelEngineInitParams> propose_params) override;
@@ -20,6 +21,12 @@ public:
     grpc::Status GenerateStreamCall(grpc::ServerContext*                   context,
                                     const GenerateInputPB*                 request,
                                     grpc::ServerWriter<GenerateOutputsPB>* writer) override {
+        // The standalone Decode benchmark has no Prefill peer. Its batch
+        // scheduler prepares synthetic decode streams; retain the regular
+        // service readiness check before routing those requests locally.
+        if (perf_local_requests_) {
+            return LocalRpcServiceImpl::GenerateStreamCall(context, request, writer);
+        }
         if (!prefill_server_) {
             auto error_msg = "server not implement GenerateStreamCall";
             RTP_LLM_LOG_ERROR(error_msg);
@@ -177,9 +184,16 @@ public:
     }
 
 private:
+    static bool allowPerfLocalRequests(const EngineInitParams& params, const char* enabled) {
+        return enabled != nullptr && std::strcmp(enabled, "1") == 0
+               && params.pd_sep_config.role_type == RoleType::DECODE && params.kv_cache_config.test_block_num > 0
+               && params.runtime_config.use_batch_decode_scheduler;
+    }
+
     std::shared_ptr<PrefillBatchRpcServer> prefill_server_;
     std::shared_ptr<DecodeRpcServer>       decode_server_;
-    bool                                    defer_cache_store_{false};
+    bool                                   defer_cache_store_{false};
+    bool                                   perf_local_requests_{false};
 };
 
 }  // namespace rtp_llm

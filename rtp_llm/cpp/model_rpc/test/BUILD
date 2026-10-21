@@ -183,3 +183,12 @@ cc_test(
     },
     exec_properties = {'gpu':'H20'},
 )
+
+# Routing policy and readiness only: no engine initialization or GPU use.
+cc_test(
+    name = "remote_rpc_service_impl_test",
+    srcs = ["RemoteRpcServiceImplTest.cc"],
+    copts = test_copts,
+    deps = test_deps,
+    env = {"CUDA_VISIBLE_DEVICES": ""},
+)

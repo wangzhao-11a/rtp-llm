@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <memory>
 #include "rtp_llm/cpp/model_rpc/RemoteRpcServiceImpl.h"
 #include "rtp_llm/cpp/model_rpc/PrefillBatchRpcServer.h"
@@ -23,6 +24,12 @@ void RemoteRpcServiceImpl::startDeferredServices() {
 grpc::Status RemoteRpcServiceImpl::init(const EngineInitParams&                                maga_init_params,
                                         py::object                                             mm_process_engine,
                                         std::unique_ptr<rtp_llm::ProposeModelEngineInitParams> propose_params) {
+    perf_local_requests_ = allowPerfLocalRequests(maga_init_params, std::getenv("RTP_LLM_PERF_LOCAL_REQUESTS"));
+    if (perf_local_requests_) {
+        RTP_LLM_LOG_INFO("RTP_LLM_PERF_LOCAL_REQUESTS enabled: routing standalone Decode benchmark requests locally; "
+                         "batch_decode_scheduler=1, test_block_num=%d",
+                         maga_init_params.kv_cache_config.test_block_num);
+    }
     if (maga_init_params.pd_sep_config.role_type == RoleType::PREFILL) {
         prefill_server_ = std::make_shared<PrefillBatchRpcServer>();
         local_server_   = prefill_server_;
